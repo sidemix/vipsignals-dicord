@@ -22,6 +22,22 @@ PROV = make_provider()
 sent = {}                # (symbol:tstamp_ns) -> True
 last_bar_index = {}      # symbol -> last bar timestamp (ns) when we signaled
 
+# Auto-select BloFin symbols if requested
+if C.PROVIDER.lower() == "blofin" and C.AUTO_SYMBOLS:
+    try:
+        from providers.blofin_provider import list_blofin_symbols, top_by_volume
+        all_syms = list_blofin_symbols(inst_type=C.BLOFIN_INST_TYPE, want_quote=C.BLOFIN_QUOTE)
+        picked   = top_by_volume(all_syms, inst_type=C.BLOFIN_INST_TYPE, want_quote=C.BLOFIN_QUOTE,
+                                 top_n=C.TOP_N, min_vol=C.MIN_24H_VOL_USDT)
+        if picked:
+            C.SYMBOLS = picked
+            send_info(f"Auto symbols ({C.BLOFIN_INST_TYPE}/{C.BLOFIN_QUOTE}): {', '.join(C.SYMBOLS)}")
+        else:
+            send_info("Auto symbols: no matches; using SYMBOLS from env.")
+    except Exception as e:
+        send_info(f"Auto symbols error: `{e}` — using SYMBOLS from env.")
+
+
 # -------- Helpers --------
 def format_tps(price: float, atr_val: float, multipliers):
     return [price + m * atr_val for m in multipliers]
