@@ -1,6 +1,6 @@
-import math, time
+import math
+import time
 import pandas as pd
-from datetime import datetime, timezone
 
 from config import Config as C
 from indicators import ema, atr, adx, sma
@@ -11,6 +11,18 @@ from providers.base import BaseProvider
 from providers.ccxt_provider import CcxtProvider
 from providers.blofin_provider import BlofinProvider
 
+# ---------------- Utility flags ----------------
+QUIET = str(getattr(C, "DEBUG", False)).lower() not in ("1","true","yes","on") and \
+        str(getattr(C, "QUIET", False) if hasattr(C, "QUIET") else False).lower() in ("1","true","yes","on")
+
+def _maybe_info(msg: str):
+    if not QUIET:
+        try:
+            send_info(msg)
+        except Exception:
+            pass
+
+# --------------- Provider factory ---------------
 def make_provider() -> BaseProvider:
     if C.PROVIDER.lower() == "blofin":
         return BlofinProvider()
@@ -18,31 +30,11 @@ def make_provider() -> BaseProvider:
 
 PROV = make_provider()
 
-# Dedup + cooldown memory
-sent = {}                # (symbol:tstamp_ns) -> True
-last_bar_index = {}      # symbol -> last bar timestamp (ns) when we signaled
+# ---------------- State (dedupe/cooldown) ----------------
+sent = {}                # (symbol:tstamp_ns) -> True (one alert per closed bar)
+last_bar_index = {}      # symbol -> last tstamp_ns when we sent a signal
 
-from discord_sender import send_info
-send_info(f"Config → PROVIDER={C.PROVIDER}, AUTO_SYMBOLS={C.AUTO_SYMBOLS}, QUOTE={C.BLOFIN_QUOTE}")
-
-
-# Auto-select BloFin symbols if requested
-if C.PROVIDER.lower() == "blofin" and C.AUTO_SYMBOLS:
-    try:
-        from providers.blofin_provider import list_blofin_symbols, top_by_volume
-        all_syms = list_blofin_symbols(inst_type=C.BLOFIN_INST_TYPE, want_quote=C.BLOFIN_QUOTE)
-        picked   = top_by_volume(all_syms, inst_type=C.BLOFIN_INST_TYPE, want_quote=C.BLOFIN_QUOTE,
-                                 top_n=C.TOP_N, min_vol=C.MIN_24H_VOL_USDT)
-        if picked:
-            C.SYMBOLS = picked
-            send_info(f"Auto symbols ({C.BLOFIN_INST_TYPE}/{C.BLOFIN_QUOTE}): {', '.join(C.SYMBOLS)}")
-        else:
-            send_info("Auto symbols: no matches; using SYMBOLS from env.")
-    except Exception as e:
-        send_info(f"Auto symbols error: `{e}` — using SYMBOLS from env.")
-
-
-# -------- Helpers --------
+# ----------------- Helpers -----------------
 def format_tps(price: float, atr_val: float, multipliers):
     return [price + m * atr_val for m in multipliers]
 
@@ -56,13 +48,13 @@ def short_setup(close_price, atr_v):
     entry_low  = close_price + C.PULL_U * atr_v
     entry_high = close_price + C.PULL_L * atr_v
     sl         = close_price + C.RISK_ATR * atr_v
-    return entry_high, entry_low, sl  # keep same order (eh, el, sl)
+    return entry_high, entry_low, sl  # keep (eh, el, sl)
 
 def passes_filters(df: pd.DataFrame):
-    # Work with last closed bar
-    adx_last = df["adx"].iloc[-2]
-    vol_last = df["volume"].iloc[-2]
-    vol_sma  = df["vol_sma20"].iloc[-2]
+    # Use last closed bar (-2)
+    adx_last = float(df["adx"].iloc[-2])
+    vol_last = float(df["volume"].iloc[-2])
+    vol_sma  = float(df["vol_sma20"].iloc[-2])
 
     if math.isnan(adx_last) or adx_last < C.MIN_ADX:
         return False
@@ -71,7 +63,7 @@ def passes_filters(df: pd.DataFrame):
     return True
 
 def htf_trend_ok(symbol: str, want_long: bool) -> bool:
-    if not C.REQUIRE_TREND_HTF:
+    if not getattr(C, "REQUIRE_TREND_HTF", True):
         return True
     try:
         df_htf = PROV.fetch_ohlcv_df(symbol, C.HTF, 300)
@@ -82,7 +74,7 @@ def htf_trend_ok(symbol: str, want_long: bool) -> bool:
         ema200 = float(df_htf["ema200"].iloc[-2])
         return price > ema200 if want_long else price < ema200
     except Exception:
-        # If HTF fetch fails, don't block signals
+        # If HTF fetch fails, allow signals (fail-open)
         return True
 
 def scan_symbol(symbol: str):
@@ -99,37 +91,36 @@ def scan_symbol(symbol: str):
     df["adx"]    = adx(df, 14)
     df["vol_sma20"] = sma(df["volume"], 20)
 
-    # Last closed bar and previous (for cross)
+    # Last closed bar (and previous for cross)
     row_prev  = df.iloc[-3]
     row       = df.iloc[-2]
     tstamp_ns = int(row["time"].value)
 
-    # Per-bar de-dup
+    # Per-bar de-dup (one alert per closed bar per symbol)
     key = f"{symbol}:{tstamp_ns}"
     if key in sent:
         return
 
-    # EMA cross + trend
+    # EMA cross + MTF trend gate
     bullCross = (df["ema5"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] <= df["ema50"].iloc[-3]) and (row["close"] > df["ema200"].iloc[-2])
     bearCross = (df["ema5"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] >= df["ema50"].iloc[-3]) and (row["close"] < df["ema200"].iloc[-2])
 
-    # Filters (ADX + volume)
+    # Base filters
     if not passes_filters(df):
         return
 
     # Cooldown in bars (avoid repeated signals in chop)
     prev_t = last_bar_index.get(symbol)
     if prev_t is not None:
-        # Estimate bar size by last two index values (ns)
         bar_ns = int(df["time"].iloc[-1].value) - int(df["time"].iloc[-2].value)
         if bar_ns > 0:
             bars_since = (tstamp_ns - prev_t) // bar_ns
             if bars_since < C.COOLDOWN_BARS:
                 return
 
-    # Optional funding filter (if provider supports it)
+    # Funding filter (optional; provider may return None)
     fr_text = None
-    if C.ENABLE_FUNDING_FILTER:
+    if getattr(C, "ENABLE_FUNDING_FILTER", False):
         try:
             fr = PROV.fetch_funding_rate(symbol)
             if fr is not None:
@@ -139,7 +130,7 @@ def scan_symbol(symbol: str):
         except Exception:
             pass
 
-    # LONG
+    # ----- LONG -----
     if bullCross and htf_trend_ok(symbol, want_long=True) and not math.isnan(row["atr"]):
         eh, el, sl = long_setup(row["close"], row["atr"])
         tps = format_tps(row["close"], row["atr"], C.TP_MULT)
@@ -150,7 +141,7 @@ def scan_symbol(symbol: str):
         last_bar_index[symbol] = tstamp_ns
         return
 
-    # SHORT
+    # ----- SHORT -----
     if bearCross and htf_trend_ok(symbol, want_long=False) and not math.isnan(row["atr"]):
         eh, el, sl = short_setup(row["close"], row["atr"])
         tps = [row["close"] - m * row["atr"] for m in C.TP_MULT]
@@ -161,32 +152,55 @@ def scan_symbol(symbol: str):
         last_bar_index[symbol] = tstamp_ns
         return
 
+def maybe_auto_symbols():
+    """
+    If AUTO_SYMBOLS is enabled and provider is BloFin, try to select pairs automatically.
+    Posts a single summary message with the final list (unless QUIET=true).
+    """
+    if C.PROVIDER.lower() != "blofin":
+        return
+    if not getattr(C, "AUTO_SYMBOLS", False):
+        return
+    try:
+        from providers.blofin_provider import list_blofin_symbols, top_by_volume
+        syms = list_blofin_symbols(
+            inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
+            want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
+        )
+        if not syms:
+            _maybe_info("Auto symbols: no matches; using SYMBOLS from env.")
+            return
+        picked = top_by_volume(
+            syms,
+            inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
+            want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
+            top_n=getattr(C, "TOP_N", 12),
+            min_vol=getattr(C, "MIN_24H_VOL_USDT", 0.0),
+        ) or syms[: getattr(C, "TOP_N", 12)]
+        C.SYMBOLS = picked
+        _maybe_info(f"Auto symbols ({getattr(C, 'BLOFIN_QUOTE', 'USDT')}): {', '.join(C.SYMBOLS)}")
+    except Exception as e:
+        _maybe_info(f"Auto symbols error: `{e}` — using SYMBOLS from env.")
+
 def main():
-    # Startup banner
+    # Optional auto-selection of symbols (BloFin)
+    maybe_auto_symbols()
+
+    # Startup banner (can be silenced with QUIET=true)
     banner = f"Started scanner on **{C.PROVIDER}**"
     if C.PROVIDER.lower() == "ccxt":
         banner += f" ({C.EXCHANGE})"
     banner += f" | TF **{C.TIMEFRAME}** | Symbols: {', '.join(C.SYMBOLS)}"
-    send_info(banner)
+    _maybe_info(banner)
 
-    # If provider can supply markets, optionally warn on unknown symbols (non-fatal)
-    try:
-        markets = PROV.load_markets() or {}
-        if markets:
-            listed = set(markets.keys())
-            bad = [s for s in C.SYMBOLS if s not in listed]
-            if bad:
-                send_info("⚠️ Not listed: " + ", ".join(bad))
-    except Exception:
-        pass
-
-    # Main loop
+    # Main scan loop — only posts actual signals
     while True:
         try:
             for s in C.SYMBOLS:
                 scan_symbol(s)
         except Exception as e:
-            send_info(f"Error: `{e}`")
+            # Only surface real errors
+            _maybe_info(f"Error: `{e}`")
         time.sleep(C.POLL_SECONDS)
 
 if __name__ == "__main__":
