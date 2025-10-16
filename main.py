@@ -72,3 +72,102 @@ def scan_symbol(symbol: str):
         return
 
     # Indicators
+    df["ema5"]   = ema(df["close"], 5)
+    df["ema50"]  = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200)
+    df["atr"]    = atr(df, 14)
+    df["adx"]    = adx(df, 14)
+    df["vol_sma20"] = sma(df["volume"], 20)
+
+    # Last closed bar and previous (for cross)
+    row_prev  = df.iloc[-3]
+    row       = df.iloc[-2]
+    tstamp_ns = int(row["time"].value)
+
+    # Per-bar de-dup
+    key = f"{symbol}:{tstamp_ns}"
+    if key in sent:
+        return
+
+    # EMA cross + trend
+    bullCross = (df["ema5"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] <= df["ema50"].iloc[-3]) and (row["close"] > df["ema200"].iloc[-2])
+    bearCross = (df["ema5"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] >= df["ema50"].iloc[-3]) and (row["close"] < df["ema200"].iloc[-2])
+
+    # Filters (ADX + volume)
+    if not passes_filters(df):
+        return
+
+    # Cooldown in bars (avoid repeated signals in chop)
+    prev_t = last_bar_index.get(symbol)
+    if prev_t is not None:
+        # Estimate bar size by last two index values (ns)
+        bar_ns = int(df["time"].iloc[-1].value) - int(df["time"].iloc[-2].value)
+        if bar_ns > 0:
+            bars_since = (tstamp_ns - prev_t) // bar_ns
+            if bars_since < C.COOLDOWN_BARS:
+                return
+
+    # Optional funding filter (if provider supports it)
+    fr_text = None
+    if C.ENABLE_FUNDING_FILTER:
+        try:
+            fr = PROV.fetch_funding_rate(symbol)
+            if fr is not None:
+                fr_text = f"Funding: {fr:.4f}%"
+                if abs(fr) > C.MAX_ABS_FUNDING:
+                    return
+        except Exception:
+            pass
+
+    # LONG
+    if bullCross and htf_trend_ok(symbol, want_long=True) and not math.isnan(row["atr"]):
+        eh, el, sl = long_setup(row["close"], row["atr"])
+        tps = format_tps(row["close"], row["atr"], C.TP_MULT)
+        extras = {"TF": C.TIMEFRAME}
+        if fr_text: extras["Info"] = fr_text
+        send_signal_embed(symbol, "LONG", C.LEVERAGE, eh, el, sl, tps, extras=extras)
+        sent[key] = True
+        last_bar_index[symbol] = tstamp_ns
+        return
+
+    # SHORT
+    if bearCross and htf_trend_ok(symbol, want_long=False) and not math.isnan(row["atr"]):
+        eh, el, sl = short_setup(row["close"], row["atr"])
+        tps = [row["close"] - m * row["atr"] for m in C.TP_MULT]
+        extras = {"TF": C.TIMEFRAME}
+        if fr_text: extras["Info"] = fr_text
+        send_signal_embed(symbol, "SHORT", C.LEVERAGE, eh, el, sl, tps, extras=extras)
+        sent[key] = True
+        last_bar_index[symbol] = tstamp_ns
+        return
+
+def main():
+    # Startup banner
+    banner = f"Started scanner on **{C.PROVIDER}**"
+    if C.PROVIDER.lower() == "ccxt":
+        banner += f" ({C.EXCHANGE})"
+    banner += f" | TF **{C.TIMEFRAME}** | Symbols: {', '.join(C.SYMBOLS)}"
+    send_info(banner)
+
+    # If provider can supply markets, optionally warn on unknown symbols (non-fatal)
+    try:
+        markets = PROV.load_markets() or {}
+        if markets:
+            listed = set(markets.keys())
+            bad = [s for s in C.SYMBOLS if s not in listed]
+            if bad:
+                send_info("⚠️ Not listed: " + ", ".join(bad))
+    except Exception:
+        pass
+
+    # Main loop
+    while True:
+        try:
+            for s in C.SYMBOLS:
+                scan_symbol(s)
+        except Exception as e:
+            send_info(f"Error: `{e}`")
+        time.sleep(C.POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
