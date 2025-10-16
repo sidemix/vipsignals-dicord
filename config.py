@@ -39,3 +39,11 @@ class Config:
 
     # ------------ Runtime ------------
     POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+
+# --- Auto-symbols for BloFin ---
+AUTO_SYMBOLS = os.getenv("AUTO_SYMBOLS", "false").strip().lower() in ("1","true","yes","on")
+BLOFIN_INST_TYPE = os.getenv("BLOFIN_INST_TYPE", "SWAP")   # "SPOT" or "SWAP"
+BLOFIN_QUOTE     = os.getenv("BLOFIN_QUOTE", "USDT")       # quote filter, e.g., USDT
+TOP_N            = int(os.getenv("TOP_N", "12"))           # keep top N by 24h quote volume
+MIN_24H_VOL_USDT = float(os.getenv("MIN_24H_VOL_USDT", "0"))  # 0 = no min
+
