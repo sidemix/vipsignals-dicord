@@ -243,12 +243,79 @@ class BlofinProvider(BaseProvider):
 
 
 # ===================== Auto-markets / Top symbols =====================
+
+def _probe_bases_default():
+    # Popular majors + alts; adjust via PROBE_BASES if you want.
+    return [
+        "BTC","ETH","SOL","XRP","ADA","DOGE","TRX","DOT","MATIC","LTC","BCH","LINK","OP","ARB",
+        "APT","SUI","ATOM","AVAX","NEAR","ETC","FIL","INJ","AAVE","UNI","MKR","DYDX","GMT","FTM",
+        "RNDR","PEPE","WIF","ENA","JTO","PYTH","TIA","ONDO","JUP","BLUR","SEI","TAO","WLD","TON",
+        "APT","IMX","APE","AEVO","JASMY","GALA","XLM","VET","ALGO","SAND","MANA","FLOW","HBAR",
+        "KAS","ROSE","SKL","AR","OPUL","ADA","MTL","ENA","OP","SFP","SSV","BEAM","BONK","TIA"
+    ]
+
+def _parse_bases_env():
+    bases = os.getenv("PROBE_BASES", "")
+    if bases.strip():
+        return [b.strip().upper() for b in bases.split(",") if b.strip()]
+    return _probe_bases_default()
+
+def _probe_pairs_via_klines(want_quote="USDT", top_n=50):
+    """
+    Last-resort discovery that asks the candles endpoint for a short list of bases.
+    If the response yields any rows, we consider the pair listed.
+    """
+    import httpx
+    want_quote = (want_quote or "USDT").upper()
+    bases = _parse_bases_env()
+    found = []
+
+    base = BLOFIN_REST_BASE.rstrip("/")
+    url  = base + BLOFIN_REST_KLINES
+    bar  = TF_MAP.get("1h", "1h")
+
+    for baseccy in bases:
+        inst_dash = f"{baseccy}-{want_quote}"   # e.g., BTC-USDT
+        params_try = [
+            {"instId": inst_dash, "bar": bar, "limit": 5},
+            {"symbol": f"{baseccy}{want_quote}", "interval": bar, "limit": 5},
+            {"symbol": inst_dash, "bar": bar, "limit": 5},
+        ]
+        ok = False
+        for params in params_try:
+            try:
+                _debug_log(f"probe {url} {params}")
+                r = httpx.get(url, params=params, timeout=8)
+                if r.status_code != 200:
+                    continue
+                js = r.json()
+                lst = _extract_list(js)
+                if lst is None and isinstance(js, dict):
+                    # try dict-of-arrays
+                    lst = js.get("t") or js.get("time")
+                    if lst and isinstance(lst, list) and len(lst) > 0:
+                        ok = True
+                        break
+                if isinstance(lst, list) and len(lst) > 0:
+                    ok = True
+                    break
+            except Exception:
+                continue
+        if ok:
+            found.append(f"{baseccy}/{want_quote}")
+        if len(found) >= top_n:
+            break
+
+    _debug_log(f"probe -> {len(found)} pairs via klines")
+    return sorted(set(found))
+
 def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
     """
     Robust discovery:
       1) Try instruments with several param names.
       2) If empty, derive from tickers (no instType required).
-    Filters only by quote to guarantee results.
+      3) If still empty, PROBE via klines for a curated list of bases.
+    Filters by quote so we always end with *something*.
     """
     base = BLOFIN_REST_BASE.rstrip("/")
     inst_url = base + BLOFIN_INSTRUMENTS
@@ -261,7 +328,7 @@ def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
         {},  # no filter; we filter by quote locally
     ]
 
-    # Try instruments first
+    # 1) instruments
     for params in attempts:
         try:
             _debug_log(f"GET {inst_url} params={params}")
@@ -288,7 +355,7 @@ def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
             _debug_log(f"instruments error: {e}")
             continue
 
-    # Fallback: use tickers only (don’t rely on instType)
+    # 2) tickers (no instType)
     try:
         _debug_log(f"GET {tick_url} (no params)")
         payload = _http_get_json(tick_url, params={})
@@ -305,18 +372,22 @@ def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
             if want_quote and q != want_quote.upper():
                 continue
             syms.append(sym)
-        out = sorted(set(syms))
-        _debug_log(f"tickers -> {len(out)} matches (quote={want_quote})")
-        return out
+        if syms:
+            out = sorted(set(syms))
+            _debug_log(f"tickers -> {len(out)} matches (quote={want_quote})")
+            return out
+        else:
+            _debug_log("tickers -> 0 matches; probing via klines")
     except Exception as e:
-        _debug_log(f"tickers error: {e}")
-        return []
+        _debug_log(f"tickers error: {e}; probing via klines")
+
+    # 3) probe klines (last resort)
+    return _probe_pairs_via_klines(want_quote=want_quote, top_n=int(os.getenv("TOP_N","12")))
 
 def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vol=0.0):
     """
-    Rank symbols by 24h quote volume using tickers endpoint.
-    We do NOT require instType; we take whatever we get and filter by quote.
-    Accept volume fields: volUsd, quoteVolume, vol24hQuote, volUsd24h, ...
+    Rank symbols by 24h quote volume using tickers endpoint (if available),
+    otherwise just return first top_n from the provided list (e.g., probe list).
     """
     if not symbols:
         return []
@@ -333,7 +404,7 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vo
             if not inst_id:
                 continue
             sym = _norm_symbol_from_inst({"instId": inst_id})
-            if not sym:
+            if not sym or sym not in symbols:
                 continue
             q = sym.split("/")[-1].upper()
             if want_quote and q != want_quote.upper():
@@ -347,12 +418,18 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vo
     except Exception as e:
         _debug_log(f"volume error: {e}")
 
-    scored = [(s, vols.get(s, 0.0)) for s in symbols]
-    if min_vol and min_vol > 0:
-        scored = [x for x in scored if x[1] >= min_vol]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    if top_n and top_n > 0:
-        scored = scored[:top_n]
-    out = [s for s, _ in scored]
-    _debug_log(f"top_by_volume -> picked {len(out)} of {len(symbols)}")
+    if vols:
+        scored = [(s, vols.get(s, 0.0)) for s in symbols]
+        if min_vol and min_vol > 0:
+            scored = [x for x in scored if x[1] >= min_vol]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        if top_n and top_n > 0:
+            scored = scored[:top_n]
+        out = [s for s, _ in scored]
+        _debug_log(f"top_by_volume -> picked {len(out)} of {len(symbols)} via tickers")
+        return out
+
+    # fallback: no volumes available; cap to top_n of discovered list
+    out = symbols[:top_n] if top_n and top_n > 0 else symbols
+    _debug_log(f"top_by_volume -> tickers missing; using first {len(out)} from probe")
     return out
