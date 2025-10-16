@@ -22,6 +22,10 @@ PROV = make_provider()
 sent = {}                # (symbol:tstamp_ns) -> True
 last_bar_index = {}      # symbol -> last bar timestamp (ns) when we signaled
 
+from discord_sender import send_info
+send_info(f"Config → PROVIDER={C.PROVIDER}, AUTO_SYMBOLS={C.AUTO_SYMBOLS}, QUOTE={C.BLOFIN_QUOTE}")
+
+
 # Auto-select BloFin symbols if requested
 if C.PROVIDER.lower() == "blofin" and C.AUTO_SYMBOLS:
     try:
