@@ -3,61 +3,101 @@ import pandas as pd
 
 from .base import BaseProvider
 
-# ===== REST configuration (override via Render env if needed) =====
+# ===== REST base & paths (override via Render env if needed) =====
 BLOFIN_REST_BASE   = os.getenv("BLOFIN_REST_BASE", "https://openapi.blofin.com")
 BLOFIN_REST_KLINES = os.getenv("BLOFIN_REST_KLINES", "/api/v1/market/candles")
-# Other common paths you can try (no code change, just env):
-#   /api/v1/public/candles
-#   /api/v1/public/market/candles
-#   /v1/market/candles
+BLOFIN_INSTRUMENTS = os.getenv("BLOFIN_INSTRUMENTS", "/api/v1/public/instruments")
+BLOFIN_TICKERS     = os.getenv("BLOFIN_TICKERS", "/api/v1/public/tickers")
 
-# Map TradingView-style timeframe strings to BloFin API values (tweak in env if needed)
+# Map TF strings → API values (customize via env if needed)
 DEFAULT_TF_MAP = {
-    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1h": "1h", "4h": "4h", "6h": "6h", "12h": "12h",
-    "1d": "1d"
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+    "1h":"1h","4h":"4h","6h":"6h","12h":"12h",
+    "1d":"1d"
 }
 TF_MAP = {**DEFAULT_TF_MAP}
 
+# ---------- tiny util/helpers ----------
 def _symbol_to_blofin_spot(symbol: str) -> str:
-    """'MTL/USDT' -> 'MTLUSDT' (occasionally useful for some endpoints)"""
+    """'MTL/USDT' -> 'MTLUSDT' (some endpoints prefer this)."""
     return symbol.replace("/", "")
 
+def _debug_log(msg: str):
+    if os.getenv("DEBUG", "").strip().lower() in ("1","true","yes","on"):
+        try:
+            from discord_sender import send_info   # avoid hard dep at import time
+            send_info(f"[BloFin] {msg}")
+        except Exception:
+            pass
+
+def _http_get_json(url, params=None, timeout=15):
+    import httpx
+    r = httpx.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _extract_list(obj):
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for k in ("data","result","rows","list","items","instruments","symbols","tickers"):
+            v = obj.get(k)
+            if isinstance(v, list):
+                return v
+    return None
+
+def _norm_symbol_from_inst(inst: dict):
+    """
+    Normalize instrument identifiers into 'BASE/QUOTE'.
+    Accepts 'instId', 'symbol', or 'instrumentId' in forms:
+      - 'BTC-USDT', 'BTC_USDT', 'BTCUSDT'
+    """
+    inst_id = inst.get("instId") or inst.get("symbol") or inst.get("instrumentId")
+    if not inst_id:
+        return None
+    s = str(inst_id).replace("_", "-")
+    if "-" in s:
+        base, _, quote = s.partition("-")
+        return f"{base}/{quote}"
+    s = s.upper()
+    if s.endswith("USDT"):
+        return f"{s[:-4]}/USDT"
+    if s.endswith("USD"):
+        return f"{s[:-3]}/USD"
+    return None
+
+
+# ===================== Provider =====================
 class BlofinProvider(BaseProvider):
     """
-    Provider that prefers the BloFin Python SDK if available, and otherwise falls back to REST.
-    Exposes a ccxt-like minimal interface for the bot:
+    Uses BloFin SDK if installed; otherwise robust REST.
+    Exposes:
       - load_markets()
-      - fetch_ohlcv_df(symbol, timeframe, limit) -> DataFrame[time,open,high,low,close,volume]
-      - fetch_funding_rate(symbol)  # optional, currently None (can be added later)
+      - fetch_ohlcv_df(symbol, timeframe, limit)
+      - fetch_funding_rate(symbol) -> None for now
     """
     def __init__(self):
         self.sdk = None
         self._markets = {}
-        # Try to initialize the SDK (optional)
         try:
             from blofin import Blofin  # type: ignore
             key    = os.getenv("BLOFIN_API_KEY")
             secret = os.getenv("BLOFIN_API_SECRET")
             passph = os.getenv("BLOFIN_API_PASSPHRASE")
-            # Public data usually doesn't require keys; passing None is fine.
             self.sdk = Blofin(api_key=key, api_secret=secret, passphrase=passph)
-        except Exception:
+            _debug_log("SDK initialized")
+        except Exception as e:
             self.sdk = None
+            _debug_log(f"SDK unavailable, using REST. ({e})")
 
-    # ---- Markets ----
     def load_markets(self) -> dict:
-        # Minimal map. If you want strict validation, query instruments via REST and build this dict.
+        # Minimal stub (auto-symbols discovery is handled by helpers below).
         return self._markets
 
-    # ---- SDK path (best effort) ----
+    # ---------- SDK path ----------
     def _sdk_fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Attempts to use SDK. If the SDK method names differ, this will throw and we fall back to REST.
-        Expected response: list of dicts or lists containing [ts, open, high, low, close, volume]
-        """
-        inst = symbol.replace("/", "-")  # "BTC/USDT" -> "BTC-USDT"
-        bar  = TF_MAP.get(timeframe, timeframe)
+        inst = symbol.replace("/", "-")          # BTC/USDT -> BTC-USDT
+        bar  = TF_MAP.get(timeframe, timeframe)  # '5m', '1h', etc.
         data = self.sdk.public.get_candlesticks(instId=inst, bar=bar, limit=limit)  # type: ignore[attr-defined]
 
         rows = []
@@ -71,8 +111,7 @@ class BlofinProvider(BaseProvider):
                 vol = float(x.get("volume")or x.get("v"))
             else:
                 ts, op, hi, lo, cl, vol = int(float(x[0])), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
-            # normalize ts to ms if in seconds
-            if ts < 10_000_000_000:
+            if ts < 10_000_000_000:  # seconds -> ms
                 ts *= 1000
             rows.append([ts, op, hi, lo, cl, vol])
 
@@ -81,35 +120,27 @@ class BlofinProvider(BaseProvider):
         df.sort_values("time", inplace=True)
         return df
 
-    # ---- REST fallback (robust parser) ----
+    # ---------- REST path (robust parser) ----------
     def _rest_fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Handles the most common REST shapes:
-          - list of lists: [[ts, o, h, l, c, v, ...], ...]
-          - list of dicts: [{"ts":..., "open":..., ...}, ...]  or {"t":[], "o":[], ...}
-          - dict of arrays: {"t":[...], "o":[...], "h":[...], "l":[...], "c":[...], "v":[...]}
-        Also tries multiple param conventions automatically (instId/bar vs symbol/interval).
-        """
         import httpx
 
         def _to_int_ms(x):
             ts = int(float(x))
             if ts < 10_000_000_000:
-                ts *= 1000  # seconds -> ms
+                ts *= 1000
             return ts
 
         def _first_list_like(obj):
-            # find the first list value under common keys
-            for k in ("data", "result", "rows", "list", "candles", "klines", "kline", "items"):
-                v = obj.get(k)
-                if isinstance(v, list) and len(v) > 0:
-                    return v
             if isinstance(obj, list):
                 return obj
+            if isinstance(obj, dict):
+                for k in ("data","result","rows","list","candles","klines","kline","items"):
+                    v = obj.get(k)
+                    if isinstance(v, list) and len(v) > 0:
+                        return v
             return None
 
         def _dict_of_arrays_to_rows(d):
-            # keys like t/o/h/l/c/v  OR time/open/high/low/close/volume
             keys_short = all(k in d for k in ("t","o","h","l","c","v"))
             keys_long  = all(k in d for k in ("time","open","high","low","close","volume"))
             if not (keys_short or keys_long):
@@ -123,10 +154,7 @@ class BlofinProvider(BaseProvider):
             n = min(len(t), len(o), len(h), len(l), len(c), len(v))
             rows = []
             for i in range(n):
-                rows.append([
-                    _to_int_ms(t[i]),
-                    float(o[i]), float(h[i]), float(l[i]), float(c[i]), float(v[i])
-                ])
+                rows.append([_to_int_ms(t[i]), float(o[i]), float(h[i]), float(l[i]), float(c[i]), float(v[i])])
             return rows
 
         pair_dash = symbol.replace("/", "-")   # BTC/USDT -> BTC-USDT
@@ -134,7 +162,6 @@ class BlofinProvider(BaseProvider):
         bar       = TF_MAP.get(timeframe, timeframe)
         base      = BLOFIN_REST_BASE.rstrip("/")
 
-        # Try several parameter styles without changing code later
         attempts = [
             (BLOFIN_REST_KLINES, {"instId": pair_dash, "bar": bar, "limit": limit}),
             (BLOFIN_REST_KLINES, {"symbol": pair_cat,  "interval": bar, "limit": limit}),
@@ -146,21 +173,20 @@ class BlofinProvider(BaseProvider):
         for path, params in attempts:
             try:
                 url = base + path
+                _debug_log(f"GET {url} params={params}")
                 r = httpx.get(url, params=params, timeout=15)
                 r.raise_for_status()
                 payload = r.json()
 
-                # Try to locate the list of rows
                 data = payload
                 rows = None
 
                 if isinstance(payload, dict):
-                    maybe_list = _first_list_like(payload)
-                    if maybe_list is None:
-                        # maybe dict-of-arrays
+                    maybe = _first_list_like(payload)
+                    if maybe is None:
                         rows = _dict_of_arrays_to_rows(payload)
                     else:
-                        data = maybe_list
+                        data = maybe
 
                 if rows is None:
                     rows = []
@@ -179,11 +205,10 @@ class BlofinProvider(BaseProvider):
                                 ts = _to_int_ms(x[0])
                                 rows.append([ts, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])])
                         else:
-                            # unexpected; try dict-of-arrays on the first element
                             if isinstance(data[0], dict):
-                                maybe = _dict_of_arrays_to_rows(data[0])
-                                if maybe:
-                                    rows = maybe
+                                maybe2 = _dict_of_arrays_to_rows(data[0])
+                                if maybe2:
+                                    rows = maybe2
 
                 if not rows and isinstance(payload, dict):
                     rows = _dict_of_arrays_to_rows(payload)
@@ -198,93 +223,129 @@ class BlofinProvider(BaseProvider):
 
             except Exception as e:
                 last_err = e
+                _debug_log(f"kline attempt failed: {e}")
                 continue
 
-        # If all attempts failed, bubble the last error so it’s visible in Discord logs
         raise last_err or RuntimeError("Failed to fetch klines from BloFin")
 
-    # ---- Public method used by the bot ----
+    # Public method used by the bot
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         if self.sdk is not None:
             try:
                 return self._sdk_fetch_ohlcv_df(symbol, timeframe, limit)
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_log(f"SDK fetch failed, fallback to REST: {e}")
         return self._rest_fetch_ohlcv_df(symbol, timeframe, limit)
 
-    # Optional funding rates hook (return None for now; wire later if desired)
+    # Funding rate hook (optional; return None for now)
     def fetch_funding_rate(self, symbol: str):
         return None
 
 
-# ===== Auto-markets / top symbols helpers (used by main.py if AUTO_SYMBOLS=true) =====
-BLOFIN_INSTRUMENTS = os.getenv("BLOFIN_INSTRUMENTS", "/api/v1/public/instruments")
-BLOFIN_TICKERS     = os.getenv("BLOFIN_TICKERS", "/api/v1/public/tickers")
-
-def _http_get_json(url, params=None, timeout=15):
-    import httpx
-    r = httpx.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-def _norm_symbol_from_inst(inst: dict) -> str | None:
-    # Expect "instId": "BTC-USDT" or similar
-    inst_id = inst.get("instId") or inst.get("symbol")
-    if not inst_id:
-        return None
-    base, _, quote = inst_id.replace("_", "-").partition("-")
-    if not quote:
-        # Fallback for concatenated style like BTCUSDT
-        s = inst_id.upper()
-        if s.endswith("USDT"):
-            base, quote = s[:-4], "USDT"
-        else:
-            return None
-    return f"{base}/{quote}"
-
+# ===================== Auto-markets / Top symbols =====================
 def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
-    """Return list of 'BASE/QUOTE' for given instrument type and quote."""
+    """
+    Robust discovery:
+      1) Try instruments with several param names.
+      2) If empty, derive from tickers (no instType required).
+    Filters only by quote to guarantee results.
+    """
     base = BLOFIN_REST_BASE.rstrip("/")
-    url  = base + BLOFIN_INSTRUMENTS
-    payload = _http_get_json(url, params={"instType": inst_type})
-    data = payload.get("data") or payload.get("result") or []
-    out = []
-    for inst in data:
-        sym = _norm_symbol_from_inst(inst)
-        if not sym:
-            continue
+    inst_url = base + BLOFIN_INSTRUMENTS
+    tick_url = base + BLOFIN_TICKERS
+
+    attempts = [
+        {"instType": inst_type},
+        {"category": inst_type},
+        {"type": inst_type},
+        {},  # no filter; we filter by quote locally
+    ]
+
+    # Try instruments first
+    for params in attempts:
         try:
-            quote = sym.split("/")[-1]
-        except Exception:
+            _debug_log(f"GET {inst_url} params={params}")
+            payload = _http_get_json(inst_url, params=params)
+            items = _extract_list(payload) or []
+            syms = []
+            for inst in items:
+                sym = _norm_symbol_from_inst(inst)
+                if not sym:
+                    continue
+                q = sym.split("/")[-1].upper()
+                if want_quote and q != want_quote.upper():
+                    continue
+                itype = (inst.get("instType") or inst.get("category") or inst.get("type") or "").upper()
+                if params and ("instType" in params or "category" in params or "type" in params):
+                    if itype and inst_type and itype != inst_type.upper():
+                        continue
+                syms.append(sym)
+            if syms:
+                out = sorted(set(syms))
+                _debug_log(f"instruments -> {len(out)} matches (quote={want_quote})")
+                return out
+        except Exception as e:
+            _debug_log(f"instruments error: {e}")
             continue
-        if want_quote and quote.upper() != want_quote.upper():
-            continue
-        out.append(sym)
-    return sorted(set(out))
+
+    # Fallback: use tickers only (don’t rely on instType)
+    try:
+        _debug_log(f"GET {tick_url} (no params)")
+        payload = _http_get_json(tick_url, params={})
+        items = _extract_list(payload) or []
+        syms = []
+        for t in items:
+            inst_id = t.get("instId") or t.get("symbol") or t.get("instrumentId")
+            if not inst_id:
+                continue
+            sym = _norm_symbol_from_inst({"instId": inst_id})
+            if not sym:
+                continue
+            q = sym.split("/")[-1].upper()
+            if want_quote and q != want_quote.upper():
+                continue
+            syms.append(sym)
+        out = sorted(set(syms))
+        _debug_log(f"tickers -> {len(out)} matches (quote={want_quote})")
+        return out
+    except Exception as e:
+        _debug_log(f"tickers error: {e}")
+        return []
 
 def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vol=0.0):
-    """Attach 24h quote volume and pick best symbols."""
+    """
+    Rank symbols by 24h quote volume using tickers endpoint.
+    We do NOT require instType; we take whatever we get and filter by quote.
+    Accept volume fields: volUsd, quoteVolume, vol24hQuote, volUsd24h, ...
+    """
     if not symbols:
         return []
     base = BLOFIN_REST_BASE.rstrip("/")
     url  = base + BLOFIN_TICKERS
-    payload = _http_get_json(url, params={"instType": inst_type})
-    data = payload.get("data") or payload.get("result") or []
 
     vols = {}
-    for t in data:
-        inst_id = t.get("instId") or t.get("symbol")
-        if not inst_id:
-            continue
-        sym = _norm_symbol_from_inst({"instId": inst_id})
-        if not sym:
-            continue
-        qv = t.get("volUsd") or t.get("quoteVolume") or t.get("vol24hQuote")
-        try:
-            qv = float(qv)
-        except Exception:
-            qv = 0.0
-        vols[sym] = qv
+    try:
+        _debug_log(f"GET {url} (no params) for volume")
+        payload = _http_get_json(url, params={})
+        items = _extract_list(payload) or []
+        for t in items:
+            inst_id = t.get("instId") or t.get("symbol") or t.get("instrumentId")
+            if not inst_id:
+                continue
+            sym = _norm_symbol_from_inst({"instId": inst_id})
+            if not sym:
+                continue
+            q = sym.split("/")[-1].upper()
+            if want_quote and q != want_quote.upper():
+                continue
+            qv = t.get("volUsd") or t.get("quoteVolume") or t.get("vol24hQuote") or t.get("volUsd24h") or 0
+            try:
+                qv = float(qv)
+            except Exception:
+                qv = 0.0
+            vols[sym] = max(vols.get(sym, 0.0), qv)
+    except Exception as e:
+        _debug_log(f"volume error: {e}")
 
     scored = [(s, vols.get(s, 0.0)) for s in symbols]
     if min_vol and min_vol > 0:
@@ -292,4 +353,6 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vo
     scored.sort(key=lambda x: x[1], reverse=True)
     if top_n and top_n > 0:
         scored = scored[:top_n]
-    return [s for s, _ in scored]
+    out = [s for s, _ in scored]
+    _debug_log(f"top_by_volume -> picked {len(out)} of {len(symbols)}")
+    return out
