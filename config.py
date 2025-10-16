@@ -1,5 +1,11 @@
 import os
 
+# add near the top
+PROVIDER = os.getenv("PROVIDER", "ccxt")  # ccxt | blofin
+EXCHANGE = os.getenv("EXCHANGE", "kraken")  # if PROVIDER=ccxt
+# If PROVIDER=blofin, EXCHANGE is ignored.
+
+
 def env_bool(name: str, default=False):
     val = os.getenv(name, str(default)).strip().lower()
     return val in ("1","true","yes","on")
