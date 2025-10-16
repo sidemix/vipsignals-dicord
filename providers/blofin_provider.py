@@ -1,24 +1,24 @@
-import os, math, time
+import os
 import pandas as pd
 
 from .base import BaseProvider
 
 # --- Config via env (REST fallback) ---
 BLOFIN_REST_BASE   = os.getenv("BLOFIN_REST_BASE", "https://openapi.blofin.com")
-BLOFIN_REST_KLINES = os.getenv("BLOFIN_REST_KLINES", "/api/v1/market/candles") 
-# NOTE: If BloFin’s actual path differs, just change BLOFIN_REST_KLINES in Render env.
-# Common patterns you can try if needed:
+BLOFIN_REST_KLINES = os.getenv("BLOFIN_REST_KLINES", "/api/v1/market/candles")
+# If BloFin’s actual path differs, change BLOFIN_REST_KLINES in env.
+# Common alternates you can try via env:
 #   /api/v1/public/candles
 #   /api/v1/public/market/candles
 #   /v1/market/candles
 
-# Map TV-style TF to common API strings (edit in env if needed)
+# Map TV-style TF to common API strings (edit via env if needed)
 DEFAULT_TF_MAP = {
-    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
-    "1h":"1h","4h":"4h","6h":"6h","12h":"12h",
-    "1d":"1d"
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "4h": "4h", "6h": "6h", "12h": "12h",
+    "1d": "1d"
 }
-TF_MAP = {**DEFAULT_TF_MAP}  # can be overridden later
+TF_MAP = {**DEFAULT_TF_MAP}  # can be overridden later if required
 
 def _symbol_to_blofin_spot(symbol: str) -> str:
     # "MTL/USDT" -> "MTLUSDT"
@@ -46,64 +46,138 @@ class BlofinProvider(BaseProvider):
 
     # --- SDK path (if available) ---
     def _sdk_fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        # This block assumes the SDK has a public candles endpoint similar to:
+        # Assumes the SDK exposes a public candles endpoint like:
         #   sdk.public.get_candlesticks(instId="BTC-USDT", bar="5m", limit=400)
-        # If names differ, tweak here. If it errors, we fall back to REST.
         inst = symbol.replace("/", "-")  # "BTC/USDT" -> "BTC-USDT"
         bar  = TF_MAP.get(timeframe, timeframe)
         data = self.sdk.public.get_candlesticks(instId=inst, bar=bar, limit=limit)  # type: ignore[attr-defined]
-        # Expected shape: list of items with [ts, open, high, low, close, volume] or dicts; normalize below
+
         rows = []
         for x in data:
-            # tolerate dict or list
             if isinstance(x, dict):
-                ts   = int(x.get("ts") or x.get("time") or x.get("t"))
+                ts   = _to_int_ms(x.get("ts") or x.get("time") or x.get("t"))
                 op   = float(x.get("open"))
                 hi   = float(x.get("high"))
                 lo   = float(x.get("low"))
                 cl   = float(x.get("close"))
                 vol  = float(x.get("volume"))
             else:
-                ts, op, hi, lo, cl, vol = int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
+                ts, op, hi, lo, cl, vol = _to_int_ms(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
             rows.append([ts, op, hi, lo, cl, vol])
         df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df.sort_values("time", inplace=True)
         return df
 
-    # --- REST fallback ---
+    # --- REST fallback (robust to multiple payload shapes) ---
     def _rest_fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         import httpx
-        pair = _symbol_to_blofin_spot(symbol)  # "MTL/USDT" -> "MTLUSDT"
-        bar  = TF_MAP.get(timeframe, timeframe)
-        url  = BLOFIN_REST_BASE.rstrip("/") + BLOFIN_REST_KLINES
-        # The most common query params pattern; if BloFin uses different keys,
-        # adjust them via the env variable BLOFIN_REST_KLINES or tweak here.
-        params = {
-            "symbol": pair,   # try "instId" if "symbol" doesn’t work
-            "interval": bar,  # try "bar" if "interval" doesn’t work
-            "limit": limit
-        }
-        r = httpx.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        payload = r.json()
-        # Try to normalize multiple possible shapes:
-        data = payload.get("data") or payload.get("result") or payload
-        rows = []
-        for x in data:
-            if isinstance(x, dict):
-                ts = int(x.get("ts") or x.get("time") or x.get("t"))
-                op = float(x.get("open"))
-                hi = float(x.get("high"))
-                lo = float(x.get("low"))
-                cl = float(x.get("close"))
-                vol = float(x.get("volume"))
-            else:
-                # Many exchanges return: [ts, open, high, low, close, volume, ...]
-                ts, op, hi, lo, cl, vol = int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])
-            rows.append([ts, op, hi, lo, cl, vol])
-        df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        return df
+
+        def _first_list_like(obj):
+            # find the first list-like value inside a dict
+            for k in ("data", "result", "rows", "list", "candles", "klines", "kline", "items"):
+                if isinstance(obj, dict):
+                    v = obj.get(k)
+                    if isinstance(v, list) and len(v) > 0:
+                        return v
+            if isinstance(obj, list):
+                return obj
+            return None
+
+        def _dict_of_arrays_to_rows(d):
+            # accept t/o/h/l/c/v or time/open/high/low/close/volume
+            keys_short = all(k in d for k in ("t","o","h","l","c","v"))
+            keys_long  = all(k in d for k in ("time","open","high","low","close","volume"))
+            if not (keys_short or keys_long):
+                return None
+            t = d["t"] if keys_short else d["time"]
+            o = d["o"] if keys_short else d["open"]
+            h = d["h"] if keys_short else d["high"]
+            l = d["l"] if keys_short else d["low"]
+            c = d["c"] if keys_short else d["close"]
+            v = d["v"] if keys_short else d["volume"]
+            n = min(len(t), len(o), len(h), len(l), len(c), len(v))
+            rows = []
+            for i in range(n):
+                rows.append([
+                    _to_int_ms(t[i]),
+                    float(o[i]), float(h[i]), float(l[i]), float(c[i]), float(v[i])
+                ])
+            return rows
+
+        pair_dash = symbol.replace("/", "-")   # e.g., BTC/USDT -> BTC-USDT
+        pair_cat  = symbol.replace("/", "")    # e.g., BTC/USDT -> BTCUSDT
+        bar       = TF_MAP.get(timeframe, timeframe)
+
+        base = BLOFIN_REST_BASE.rstrip("/")
+
+        # Try a few common param conventions without code redeploys
+        attempts = [
+            (BLOFIN_REST_KLINES, {"instId": pair_dash, "bar": bar,      "limit": limit}),
+            (BLOFIN_REST_KLINES, {"symbol": pair_cat,  "interval": bar, "limit": limit}),
+            (BLOFIN_REST_KLINES, {"instId": pair_dash, "interval": bar, "limit": limit}),
+            (BLOFIN_REST_KLINES, {"symbol": pair_dash, "bar": bar,      "limit": limit}),
+        ]
+
+        last_err = None
+        for path, params in attempts:
+            try:
+                url = base + path
+                r = httpx.get(url, params=params, timeout=15)
+                r.raise_for_status()
+                payload = r.json()
+
+                # Extract the candles section
+                data = payload
+                rows = None
+                if isinstance(payload, dict):
+                    cand = _first_list_like(payload)
+                    if cand is None:
+                        # maybe dict-of-arrays
+                        rows = _dict_of_arrays_to_rows(payload)
+                    else:
+                        data = cand
+
+                if rows is None:
+                    rows = []
+                    if isinstance(data, list) and len(data) > 0:
+                        if isinstance(data[0], dict):
+                            for x in data:
+                                ts = _to_int_ms(x.get("ts") or x.get("time") or x.get("t"))
+                                op = float(x.get("open")  or x.get("o"))
+                                hi = float(x.get("high")  or x.get("h"))
+                                lo = float(x.get("low")   or x.get("l"))
+                                cl = float(x.get("close") or x.get("c"))
+                                vol= float(x.get("volume")or x.get("v"))
+                                rows.append([ts, op, hi, lo, cl, vol])
+                        elif isinstance(data[0], (list, tuple)):
+                            # typical: [ts, open, high, low, close, volume, ...]
+                            for x in data:
+                                ts = _to_int_ms(x[0])
+                                rows.append([ts, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])])
+                        else:
+                            # unexpected; try dict-of-arrays on first element
+                            if isinstance(data[0], dict):
+                                maybe = _dict_of_arrays_to_rows(data[0])
+                                if maybe:
+                                    rows = maybe
+
+                if not rows and isinstance(payload, dict):
+                    # last resort on root
+                    rows = _dict_of_arrays_to_rows(payload)
+
+                if not rows:
+                    raise ValueError("Unrecognized kline payload shape")
+
+                df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+                df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+                df.sort_values("time", inplace=True)
+                return df
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise last_err or RuntimeError("Failed to fetch klines from BloFin")
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         if self.sdk is not None:
@@ -112,6 +186,7 @@ class BlofinProvider(BaseProvider):
             except Exception:
                 pass
         return self._rest_fetch_ohlcv_df(symbol, timeframe, limit)
+
 
 # ---------- Auto markets + top symbols ----------
 BLOFIN_INSTRUMENTS = os.getenv("BLOFIN_INSTRUMENTS", "/api/v1/public/instruments")
@@ -123,7 +198,7 @@ def _http_get_json(url, params=None, timeout=15):
     r.raise_for_status()
     return r.json()
 
-def _norm_symbol_from_inst(inst: dict) -> str:
+def _norm_symbol_from_inst(inst: dict) -> str | None:
     # Expect "instId": "BTC-USDT" or similar
     inst_id = inst.get("instId") or inst.get("symbol")
     if not inst_id:
@@ -167,7 +242,6 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vo
     payload = _http_get_json(url, params={"instType": inst_type})
     data = payload.get("data") or payload.get("result") or []
 
-    # map instId -> 24h quote vol
     vols = {}
     for t in data:
         inst_id = t.get("instId") or t.get("symbol")
@@ -191,3 +265,11 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vo
         scored = scored[:top_n]
     return [s for s, _ in scored]
 
+
+# --------- utilities ---------
+def _to_int_ms(x):
+    """Accept ms or sec; return milliseconds as int."""
+    ts = int(float(x))
+    if ts < 10_000_000_000:  # seconds → ms
+        ts *= 1000
+    return ts
