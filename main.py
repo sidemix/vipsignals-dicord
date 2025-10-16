@@ -3,7 +3,23 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from config import Config as C
-from exchanges import make_exchange, fetch_ohlcv_df, fetch_funding_rate
+from providers.base import BaseProvider
+from providers.ccxt_provider import CcxtProvider
+from providers.blofin_provider import BlofinProvider
+
+def make_provider() -> BaseProvider:
+    if C.PROVIDER.lower() == "blofin":
+        return BlofinProvider()
+    # default
+    return CcxtProvider(C.EXCHANGE)
+
+PROV = make_provider()
+markets = {}
+try:
+    markets = PROV.load_markets() or {}
+except Exception:
+    markets = {}
+
 from indicators import ema, atr, adx, sma
 from discord_sender import send_signal_embed, send_info
 
@@ -40,7 +56,13 @@ def passes_filters(df):
     return True, "OK"
 
 def scan_symbol(ex, symbol: str):
-    df = fetch_ohlcv_df(ex, symbol, C.TIMEFRAME, C.MIN_BARS)
+   df = PROV.fetch_ohlcv_df(symbol, C.TIMEFRAME, C.MIN_BARS)
+fr = None
+try:
+    fr = PROV.fetch_funding_rate(symbol)
+except Exception:
+    fr = None
+
     if len(df) < C.MIN_BARS:
         return
 
