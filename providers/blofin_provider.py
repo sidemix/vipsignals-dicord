@@ -112,3 +112,82 @@ class BlofinProvider(BaseProvider):
             except Exception:
                 pass
         return self._rest_fetch_ohlcv_df(symbol, timeframe, limit)
+
+# ---------- Auto markets + top symbols ----------
+BLOFIN_INSTRUMENTS = os.getenv("BLOFIN_INSTRUMENTS", "/api/v1/public/instruments")
+BLOFIN_TICKERS     = os.getenv("BLOFIN_TICKERS", "/api/v1/public/tickers")
+
+def _http_get_json(url, params=None, timeout=15):
+    import httpx
+    r = httpx.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _norm_symbol_from_inst(inst: dict) -> str:
+    # Expect "instId": "BTC-USDT" or similar
+    inst_id = inst.get("instId") or inst.get("symbol")
+    if not inst_id:
+        return None
+    base, _, quote = inst_id.replace("_", "-").partition("-")
+    if not quote:
+        # fallback (BTCUSDT)
+        s = inst_id.upper()
+        if s.endswith("USDT"):
+            base, quote = s[:-4], "USDT"
+        else:
+            return None
+    return f"{base}/{quote}"
+
+def list_blofin_symbols(inst_type="SWAP", want_quote="USDT"):
+    """Return list of 'BASE/QUOTE' for given instrument type and quote."""
+    base = BLOFIN_REST_BASE.rstrip("/")
+    url  = base + BLOFIN_INSTRUMENTS
+    payload = _http_get_json(url, params={"instType": inst_type})
+    data = payload.get("data") or payload.get("result") or []
+    out = []
+    for inst in data:
+        sym = _norm_symbol_from_inst(inst)
+        if not sym:
+            continue
+        try:
+            quote = sym.split("/")[-1]
+        except Exception:
+            continue
+        if want_quote and quote.upper() != want_quote.upper():
+            continue
+        out.append(sym)
+    return sorted(set(out))
+
+def top_by_volume(symbols, inst_type="SWAP", want_quote="USDT", top_n=12, min_vol=0.0):
+    """Attach 24h quote volume and pick best symbols."""
+    if not symbols:
+        return []
+    base = BLOFIN_REST_BASE.rstrip("/")
+    url  = base + BLOFIN_TICKERS
+    payload = _http_get_json(url, params={"instType": inst_type})
+    data = payload.get("data") or payload.get("result") or []
+
+    # map instId -> 24h quote vol
+    vols = {}
+    for t in data:
+        inst_id = t.get("instId") or t.get("symbol")
+        if not inst_id:
+            continue
+        sym = _norm_symbol_from_inst({"instId": inst_id})
+        if not sym:
+            continue
+        qv = t.get("volUsd") or t.get("quoteVolume") or t.get("vol24hQuote")
+        try:
+            qv = float(qv)
+        except Exception:
+            qv = 0.0
+        vols[sym] = qv
+
+    scored = [(s, vols.get(s, 0.0)) for s in symbols]
+    if min_vol and min_vol > 0:
+        scored = [x for x in scored if x[1] >= min_vol]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if top_n and top_n > 0:
+        scored = scored[:top_n]
+    return [s for s, _ in scored]
+
