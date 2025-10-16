@@ -5,6 +5,7 @@ PROVIDER = os.getenv("PROVIDER", "ccxt")  # ccxt | blofin
 EXCHANGE = os.getenv("EXCHANGE", "kraken")  # if PROVIDER=ccxt
 # If PROVIDER=blofin, EXCHANGE is ignored.
 
+COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "12"))  # lock out repeat signals for N closed bars
 
 def env_bool(name: str, default=False):
     val = os.getenv(name, str(default)).strip().lower()
