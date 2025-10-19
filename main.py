@@ -1,3 +1,4 @@
+# main.py
 import math
 import time
 import pandas as pd
@@ -6,14 +7,12 @@ from config import Config as C
 from indicators import ema, atr, adx, sma
 from discord_sender import send_signal_embed, send_info
 
-# ---- Provider abstraction ----
-from providers.base import BaseProvider
-from providers.ccxt_provider import CcxtProvider
-from providers.blofin_provider import BlofinProvider
-
 # ---------------- Utility flags ----------------
-QUIET = str(getattr(C, "DEBUG", False)).lower() not in ("1","true","yes","on") and \
-        str(getattr(C, "QUIET", False) if hasattr(C, "QUIET") else False).lower() in ("1","true","yes","on")
+QUIET = (
+    str(getattr(C, "DEBUG", False)).lower() not in ("1", "true", "yes", "on")
+    and str(getattr(C, "QUIET", False) if hasattr(C, "QUIET") else False).lower()
+    in ("1", "true", "yes", "on")
+)
 
 def _maybe_info(msg: str):
     if not QUIET:
@@ -22,17 +21,36 @@ def _maybe_info(msg: str):
         except Exception:
             pass
 
+
 # --------------- Provider factory ---------------
-def make_provider() -> BaseProvider:
-    if C.PROVIDER.lower() == "blofin":
+def make_provider():
+    """
+    Choose the market data provider:
+
+      PROVIDER=hyperliquid  -> HyperliquidProvider (REST)
+      PROVIDER=blofin       -> BlofinProvider (REST)
+
+    If neither is specified, default to Hyperliquid.
+    (We intentionally do NOT auto-fall back to ccxt here.)
+    """
+    prov = (getattr(C, "PROVIDER", "") or "").strip().lower()
+
+    if prov == "blofin":
+        from providers.blofin_provider import BlofinProvider
         return BlofinProvider()
-    return CcxtProvider(C.EXCHANGE)
+
+    # default & recommended for your setup
+    from providers.hyperliquid_provider import HyperliquidProvider
+    return HyperliquidProvider()
+
 
 PROV = make_provider()
+
 
 # ---------------- State (dedupe/cooldown) ----------------
 sent = {}                # (symbol:tstamp_ns) -> True (one alert per closed bar)
 last_bar_index = {}      # symbol -> last tstamp_ns when we sent a signal
+
 
 # ----------------- Helpers -----------------
 def format_tps(price: float, atr_val: float, multipliers):
@@ -102,8 +120,16 @@ def scan_symbol(symbol: str):
         return
 
     # EMA cross + MTF trend gate
-    bullCross = (df["ema5"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] <= df["ema50"].iloc[-3]) and (row["close"] > df["ema200"].iloc[-2])
-    bearCross = (df["ema5"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] >= df["ema50"].iloc[-3]) and (row["close"] < df["ema200"].iloc[-2])
+    bullCross = (
+        df["ema5"].iloc[-2] > df["ema50"].iloc[-2]
+        and df["ema5"].iloc[-3] <= df["ema50"].iloc[-3]
+        and row["close"] > df["ema200"].iloc[-2]
+    )
+    bearCross = (
+        df["ema5"].iloc[-2] < df["ema50"].iloc[-2]
+        and df["ema5"].iloc[-3] >= df["ema50"].iloc[-3]
+        and row["close"] < df["ema200"].iloc[-2]
+    )
 
     # Base filters
     if not passes_filters(df):
@@ -135,7 +161,8 @@ def scan_symbol(symbol: str):
         eh, el, sl = long_setup(row["close"], row["atr"])
         tps = format_tps(row["close"], row["atr"], C.TP_MULT)
         extras = {"TF": C.TIMEFRAME}
-        if fr_text: extras["Info"] = fr_text
+        if fr_text:
+            extras["Info"] = fr_text
         send_signal_embed(symbol, "LONG", C.LEVERAGE, eh, el, sl, tps, extras=extras)
         sent[key] = True
         last_bar_index[symbol] = tstamp_ns
@@ -146,51 +173,76 @@ def scan_symbol(symbol: str):
         eh, el, sl = short_setup(row["close"], row["atr"])
         tps = [row["close"] - m * row["atr"] for m in C.TP_MULT]
         extras = {"TF": C.TIMEFRAME}
-        if fr_text: extras["Info"] = fr_text
+        if fr_text:
+            extras["Info"] = fr_text
         send_signal_embed(symbol, "SHORT", C.LEVERAGE, eh, el, sl, tps, extras=extras)
         sent[key] = True
         last_bar_index[symbol] = tstamp_ns
         return
 
+
+# ----------------- Auto symbols (BloFin + Hyperliquid) -----------------
 def maybe_auto_symbols():
     """
-    If AUTO_SYMBOLS is enabled and provider is BloFin, try to select pairs automatically.
-    Posts a single summary message with the final list (unless QUIET=true).
+    If AUTO_SYMBOLS is enabled, try to select pairs automatically for the
+    active provider (Hyperliquid or BloFin). Otherwise leave C.SYMBOLS as-is.
     """
-    if C.PROVIDER.lower() != "blofin":
-        return
     if not getattr(C, "AUTO_SYMBOLS", False):
         return
+
+    prov = (getattr(C, "PROVIDER", "") or "").strip().lower()
     try:
-        from providers.blofin_provider import list_blofin_symbols, top_by_volume
-        syms = list_blofin_symbols(
-            inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
-            want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
-        )
+        if prov == "blofin":
+            from providers.blofin_provider import list_blofin_symbols, top_by_volume
+            syms = list_blofin_symbols(
+                inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
+                want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
+            )
+            if not syms:
+                _maybe_info("Auto symbols: no matches; using SYMBOLS from env.")
+                return
+            picked = top_by_volume(
+                syms,
+                inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
+                want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
+                top_n=getattr(C, "TOP_N", 12),
+                min_vol=getattr(C, "MIN_24H_VOL_USDT", 0.0),
+            ) or syms[: getattr(C, "TOP_N", 12)]
+            C.SYMBOLS = picked
+            _maybe_info(f"Auto symbols ({getattr(C, 'BLOFIN_QUOTE', 'USDT')}): {', '.join(C.SYMBOLS)}")
+            return
+
+        # default: hyperliquid
+        from providers.hyperliquid_provider import list_hl_symbols, top_by_volume as hl_top_by_volume
+        want_quote = (getattr(C, "HL_FORCE_QUOTE", "") or getattr(C, "HL_QUOTE", "USD")).upper()
+        syms = list_hl_symbols(inst_type="SWAP", want_quote=want_quote)
         if not syms:
             _maybe_info("Auto symbols: no matches; using SYMBOLS from env.")
             return
-        picked = top_by_volume(
+        picked = hl_top_by_volume(
             syms,
-            inst_type=getattr(C, "BLOFIN_INST_TYPE", "SWAP"),
-            want_quote=getattr(C, "BLOFIN_QUOTE", "USDT"),
+            inst_type="SWAP",
+            want_quote=want_quote,
             top_n=getattr(C, "TOP_N", 12),
             min_vol=getattr(C, "MIN_24H_VOL_USDT", 0.0),
         ) or syms[: getattr(C, "TOP_N", 12)]
         C.SYMBOLS = picked
-        _maybe_info(f"Auto symbols ({getattr(C, 'BLOFIN_QUOTE', 'USDT')}): {', '.join(C.SYMBOLS)}")
+        _maybe_info(f"Auto symbols ({want_quote}): {', '.join(C.SYMBOLS)}")
     except Exception as e:
         _maybe_info(f"Auto symbols error: `{e}` — using SYMBOLS from env.")
 
+
+# ----------------- Main loop -----------------
 def main():
-    # Optional auto-selection of symbols (BloFin)
+    # Optional auto-selection of symbols (provider-based)
     maybe_auto_symbols()
 
-    # Startup banner (can be silenced with QUIET=true)
-    banner = f"Started scanner on **{C.PROVIDER}**"
-    if C.PROVIDER.lower() == "ccxt":
-        banner += f" ({C.EXCHANGE})"
-    banner += f" | TF **{C.TIMEFRAME}** | Symbols: {', '.join(C.SYMBOLS)}"
+    # Startup banner
+    label = (
+        (getattr(C, "EXCHANGE_LABEL", "") or "").strip()
+        or (getattr(C, "PROVIDER", "scanner"))
+    )
+    banner = f"Started scanner on **{label}** | TF **{C.TIMEFRAME}** | Symbols: {', '.join(C.SYMBOLS)}"
     _maybe_info(banner)
 
     # Main scan loop — only posts actual signals
@@ -199,9 +251,9 @@ def main():
             for s in C.SYMBOLS:
                 scan_symbol(s)
         except Exception as e:
-            # Only surface real errors
             _maybe_info(f"Error: `{e}`")
         time.sleep(C.POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()
