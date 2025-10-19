@@ -30,3 +30,24 @@ def fetch_funding_rate(exchange, symbol: str):
     except Exception:
         return None
 
+# exchanges.py (or wherever ccxt is initialized)
+import os
+
+USE_CCXT = os.getenv("EXCHANGE", "").strip().lower() not in ("", "none", "hyperliquid")
+
+exchange = None
+if USE_CCXT:
+    import ccxt  # noqa
+    # build the selected ccxt exchange instance as before
+    # exchange = ccxt.binance() ... etc.
+
+def load_markets_or_empty():
+    return exchange.load_markets() if exchange else {}
+
+def has_market(symbol: str) -> bool:
+    mkts = load_markets_or_empty()
+    return symbol in mkts if mkts else True   # if no ccxt, don’t block
+
+
+
+
