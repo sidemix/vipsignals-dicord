@@ -33,6 +33,36 @@ def make_provider() -> BaseProvider:
 
 PROV = make_provider()
 
+def filter_symbols_for_hl(symbols):
+    """
+    Keep only BASE/USD where BASE exists on Hyperliquid (/info allMids).
+    Logs what is skipped so you can fix your env.
+    """
+    try:
+        from providers.hyperliquid_provider import list_available_coins
+        coins = list_available_coins()
+    except Exception:
+        coins = set()
+
+    if not coins:
+        return symbols  # no info; keep as-is
+
+    kept, skipped = [], []
+    for sym in symbols:
+        base = sym.split("/")[0].upper()
+        if base in coins:
+            kept.append(f"{base}/USD")  # force USD quote
+        else:
+            skipped.append(sym)
+
+    if skipped:
+        try:
+            send_info(f"HL: skipping unsupported symbols: {', '.join(skipped)}")
+        except Exception:
+            pass
+    return kept or symbols
+
+
 # ---------------- State ----------------
 sent = {}                # (symbol:tstamp_ns)
 last_bar_index = {}      # symbol -> last tstamp_ns
