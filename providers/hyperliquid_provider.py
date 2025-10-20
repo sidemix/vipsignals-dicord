@@ -1,23 +1,17 @@
 # providers/hyperliquid_provider.py
-import os, time, math
+import os
+import time
 import pandas as pd
 from .base import BaseProvider
 
-try:
-    import httpx
-except Exception:
-    httpx = None
-
+# ---------- Config (override via env if needed) ----------
 HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz")
+# Leave HL_KLINES unset; we post to /info with candleSnapshot
+HL_KLINES      = os.getenv("HL_KLINES", "")
 HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")
 HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")
 
-# ---- rate limit knobs (tune via env if needed) ----
-# minimum delay between POSTs (seconds)
-HL_MIN_INTERVAL = float(os.getenv("HL_MIN_INTERVAL", "0.25"))  # ~4 req/s
-# max retries on 429 and transient errors
-HL_MAX_RETRIES  = int(os.getenv("HL_MAX_RETRIES", "3"))
-
+# Map TF strings → common API values
 DEFAULT_TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
     "1h":"1h","2h":"2h","4h":"4h","6h":"6h","12h":"12h",
@@ -25,19 +19,24 @@ DEFAULT_TF_MAP = {
 }
 TF_MAP = {**DEFAULT_TF_MAP}
 
+# ---------- Tiny utils ----------
 def _debug(msg: str):
     if os.getenv("DEBUG", "").strip().lower() in ("1","true","yes","on"):
         try:
-            from discord_sender import send_info
+            from discord_sender import send_info  # avoid hard dep at import time
             send_info(f"[HL] {msg}")
         except Exception:
             print(f"[HL] {msg}")
 
-def _to_ms(x):
-    ts = int(float(x))
-    if ts < 10_000_000_000:
-        ts *= 1000
-    return ts
+def _http_post(url, json, timeout=20):
+    import httpx
+    return httpx.post(url, json=json, timeout=timeout)
+
+def _http_get_json(url, params=None, timeout=15):
+    import httpx
+    r = httpx.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 def _extract_list(obj):
     if isinstance(obj, list):
@@ -49,12 +48,24 @@ def _extract_list(obj):
                 return v
     return None
 
+def _to_ms(x):
+    ts = int(float(x))
+    if ts < 10_000_000_000:  # seconds → ms
+        ts *= 1000
+    return ts
+
 def _parse_rows(payload):
+    """
+    Normalize various candle payloads to:
+      [time_ms, open, high, low, close, volume]
+    """
     data = payload
     rows = None
+
     if isinstance(payload, dict):
         maybe = _extract_list(payload)
         if maybe is None:
+            # dict-of-arrays fallback: {t/o/h/l/c/v: [...] } or {time/open/...}
             short = all(k in payload for k in ("t","o","h","l","c","v"))
             long  = all(k in payload for k in ("time","open","high","low","close","volume"))
             if short or long:
@@ -84,45 +95,16 @@ def _parse_rows(payload):
             for x in data:
                 ts = _to_ms(x[0])
                 rows.append([ts, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])])
-    return rows if rows else None
+    return rows or None
 
 def _force_quote(sym: str) -> str:
+    # Hyperliquid perps quote in USD
     target = (os.getenv("HL_FORCE_QUOTE", "USD") or "USD").upper()
     base, sep, quote = sym.upper().partition("/")
-    if sep and target and quote != target:
-        return f"{base}/{target}"
-    return sym.upper()
+    return f"{base}/{target}" if sep and quote != target else sym.upper()
 
-def _interval_to_seconds(bar: str) -> int:
-    u = bar[-1]
-    n = int(bar[:-1])
-    return n * (60 if u=="m" else 3600 if u=="h" else 86400)
-
+# ---------- Provider ----------
 class HyperliquidProvider(BaseProvider):
-    _client = None
-    _last_post = 0.0
-
-    @classmethod
-    def _get_client(cls):
-        if cls._client is None:
-            if httpx is None:
-                raise RuntimeError("httpx not installed")
-            cls._client = httpx.Client(
-                base_url=HL_REST_BASE,
-                timeout=20.0,
-                limits=httpx.Limits(max_connections=8, max_keepalive_connections=8),
-                headers={"Accept": "application/json"}
-            )
-        return cls._client
-
-    @classmethod
-    def _rate_limit(cls):
-        now = time.monotonic()
-        wait = HL_MIN_INTERVAL - (now - cls._last_post)
-        if wait > 0:
-            time.sleep(wait)
-        cls._last_post = time.monotonic()
-
     def __init__(self):
         self._markets = {}
 
@@ -130,61 +112,90 @@ class HyperliquidProvider(BaseProvider):
         return self._markets
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        symbol = _force_quote(symbol)
-        coin   = symbol.split("/")[0]
-        bar    = TF_MAP.get(timeframe, timeframe)
+        """
+        Fetch candles by POSTing to /info with known working shapes:
+          1) {"type":"candleSnapshot","coin":"BTC","interval":"5m","n":400}
+          2) same, but nested in "req"
+          3) start/end in seconds and milliseconds (some nodes require ranges)
+        Retries on 429 with backoff.
+        """
+        symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
+        coin     = symbol.split("/")[0]           # "BTC"
+        interval = TF_MAP.get(timeframe, timeframe)
+        url      = HL_REST_BASE.rstrip("/") + "/info"
 
-        # Prefer bounded-by-count query; HL supports candle snapshots via POST /info
-        body_candidates = [
-            {"type": "candleSnapshot", "coin": coin, "interval": bar, "n": limit},
-            # time-bounded variants as fallback
-            self._time_bounded_body(coin, bar, limit),
+        # time ranges in both seconds and ms
+        now_s  = int(time.time())
+        now_ms = now_s * 1000
+
+        def _secs_per_bar(bar: str) -> int:
+            try:
+                n, u = int(bar[:-1]), bar[-1]
+                return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60)
+            except Exception:
+                return 60
+
+        spb = _secs_per_bar(interval)
+        start_s  = now_s  - (limit + 5) * spb
+        start_ms = now_ms - (limit + 5) * spb * 1000
+
+        bodies = [
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "n": int(limit)},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "n": int(limit)}},
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s},
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s}},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms}},
         ]
 
-        client = self._get_client()
+        backoff = 0.6
         last_err = None
-        for body in body_candidates:
-            for attempt in range(1, HL_MAX_RETRIES + 1):
+        for attempt in range(6):  # retry a few times (handles 429)
+            for body in bodies:
                 try:
-                    self._rate_limit()
-                    _debug(f"POST /info json={body} (attempt {attempt})")
-                    r = client.post("/info", json=body)
+                    _debug(f"POST {url} json={body}")
+                    r = _http_post(url, json=body, timeout=25)
+
+                    # 429: gentle backoff, then try again
                     if r.status_code == 429:
-                        retry = float(r.headers.get("Retry-After", 0)) or min(2.0 * attempt, 6.0)
-                        _debug(f"429 rate limited; sleeping {retry:.2f}s")
-                        time.sleep(retry)
+                        _debug("429 rate limited; backing off…")
+                        time.sleep(backoff)
+                        backoff = min(backoff * 1.8, 6.0)
                         continue
-                    r.raise_for_status()
+
+                    # Other HTTP errors: try next body shape
+                    if r.status_code >= 400:
+                        last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
+                        _debug(f"bad status: {last_err}")
+                        continue
+
                     payload = r.json()
-                    # payload is sometimes directly a list, sometimes {'data': [...]}
-                    rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or [])
+                    rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
                     if not rows:
-                        raise RuntimeError("Unrecognized candle payload")
+                        last_err = RuntimeError("unrecognized_payload")
+                        continue
+
                     df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
                     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
                     df.sort_values("time", inplace=True)
                     return df
+
                 except Exception as e:
                     last_err = e
-                    backoff = 0.4 * attempt
-                    _debug(f"candle fetch failed: {e}; backoff {backoff:.2f}s")
-                    time.sleep(backoff)
+                    _debug(f"exception: {e}")
+                    time.sleep(0.25)
                     continue
 
-        raise last_err or RuntimeError("Failed to fetch Hyperliquid candles via POST /info")
-
-    def _time_bounded_body(self, coin: str, bar: str, limit: int):
-        now_ms = int(time.time() * 1000)
-        span   = (limit + 5) * _interval_to_seconds(bar) * 1000
-        return {"type": "candleSnapshot", "coin": coin, "interval": bar,
-                "startTime": now_ms - span, "endTime": now_ms}
+        raise last_err or RuntimeError("Failed to fetch Hyperliquid candles")
 
     def fetch_funding_rate(self, symbol: str):
+        # Not implemented for HL in this bot; return None so the scanner doesn't block.
         return None
 
 
-# -------- auto-symbol helpers (same as before) --------
+# ---------- Auto-markets helpers (optional) ----------
 def _norm_symbol_from_inst(inst: dict):
+    # Accept: "BTC-USD" / "BTC_USD" / "BTCUSD"
     inst_id = inst.get("instId") or inst.get("symbol") or inst.get("instrumentId")
     if not inst_id:
         return None
@@ -199,11 +210,15 @@ def _norm_symbol_from_inst(inst: dict):
     return None
 
 def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
+    """
+    Tries to list instruments (if HL exposes it on your node).
+    If it returns nothing, your bot will fall back to the SYMBOLS env.
+    """
+    base = HL_REST_BASE.rstrip("/")
+    url  = base + HL_INSTRUMENTS
     try:
-        client = HyperliquidProvider._get_client()
-        r = client.get(HL_INSTRUMENTS)
-        r.raise_for_status()
-        items = _extract_list(r.json()) or []
+        payload = _http_get_json(url, params={})
+        items = _extract_list(payload) or []
         out = []
         for inst in items:
             sym = _norm_symbol_from_inst(inst)
@@ -221,14 +236,19 @@ def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
         return []
 
 def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol=0.0):
+    """
+    Attempts to rank by 24h quote volume (if HL exposes tickers on your node).
+    Falls back to the first N symbols if no volume field is available.
+    """
     if not symbols:
         return []
+    base = HL_REST_BASE.rstrip("/")
+    url  = base + HL_TICKERS
+
     vols = {}
     try:
-        client = HyperliquidProvider._get_client()
-        r = client.get(HL_TICKERS)
-        r.raise_for_status()
-        items = _extract_list(r.json()) or []
+        payload = _http_get_json(url, params={})
+        items = _extract_list(payload) or []
         for t in items:
             inst_id = t.get("instId") or t.get("symbol") or t.get("instrumentId")
             sym = _norm_symbol_from_inst({"instId": inst_id}) if inst_id else None
@@ -242,7 +262,7 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol
                 qv = float(qv)
             except Exception:
                 qv = 0.0
-            vols[sym] = max(vols.get(sym, 0.0), qv)
+            vols[sym] = max(vols.get(s, 0.0) if (s := sym) in vols else 0.0, qv)
     except Exception as e:
         _debug(f"tickers/volume error: {e}")
 
@@ -252,4 +272,5 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol
             scored = [x for x in scored if x[1] >= min_vol]
         scored.sort(key=lambda x: x[1], reverse=True)
         return [s for s, _ in (scored[:top_n] if top_n else scored)]
+
     return symbols[:top_n] if top_n else symbols
