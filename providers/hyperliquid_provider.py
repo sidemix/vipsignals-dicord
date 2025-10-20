@@ -6,12 +6,10 @@ from .base import BaseProvider
 
 # ---------- Config (override via env if needed) ----------
 HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz")
-# Leave HL_KLINES unset; we post to /info with candleSnapshot
-HL_KLINES      = os.getenv("HL_KLINES", "")
 HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")
 HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")
 
-# Map TF strings → common API values
+# Map TF strings → API values Hyperliquid accepts (5m, 1h, 1d, etc.)
 DEFAULT_TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
     "1h":"1h","2h":"2h","4h":"4h","6h":"6h","12h":"12h",
@@ -56,7 +54,7 @@ def _to_ms(x):
 
 def _parse_rows(payload):
     """
-    Normalize various candle payloads to:
+    Normalize various candle payloads to rows:
       [time_ms, open, high, low, close, volume]
     """
     data = payload
@@ -103,6 +101,13 @@ def _force_quote(sym: str) -> str:
     base, sep, quote = sym.upper().partition("/")
     return f"{base}/{target}" if sep and quote != target else sym.upper()
 
+def _secs_per_bar(bar: str) -> int:
+    try:
+        n, u = int(bar[:-1]), bar[-1]
+        return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60)
+    except Exception:
+        return 60
+
 # ---------- Provider ----------
 class HyperliquidProvider(BaseProvider):
     def __init__(self):
@@ -113,78 +118,63 @@ class HyperliquidProvider(BaseProvider):
 
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         """
-        Fetch candles by POSTing to /info with known working shapes:
-          1) {"type":"candleSnapshot","coin":"BTC","interval":"5m","n":400}
-          2) same, but nested in "req"
-          3) start/end in seconds and milliseconds (some nodes require ranges)
-        Retries on 429 with backoff.
+        Fetch candles via POST /info with:
+          {"type":"candleSnapshot","req":{"coin": <BASE>, "interval": <TF>, "startTime": <ms>, "endTime": <ms>}}
+        Uses ms timestamps (required). Retries 429s with backoff.
         """
         symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
         coin     = symbol.split("/")[0]           # "BTC"
         interval = TF_MAP.get(timeframe, timeframe)
         url      = HL_REST_BASE.rstrip("/") + "/info"
 
-        # time ranges in both seconds and ms
-        now_s  = int(time.time())
-        now_ms = now_s * 1000
+        now_ms   = int(time.time() * 1000)
+        spb_ms   = _secs_per_bar(interval) * 1000
+        start_ms = now_ms - (limit + 5) * spb_ms  # a few extra bars for safety
 
-        def _secs_per_bar(bar: str) -> int:
-            try:
-                n, u = int(bar[:-1]), bar[-1]
-                return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60)
-            except Exception:
-                return 60
-
-        spb = _secs_per_bar(interval)
-        start_s  = now_s  - (limit + 5) * spb
-        start_ms = now_ms - (limit + 5) * spb * 1000
-
-        bodies = [
-            {"type": "candleSnapshot", "coin": coin, "interval": interval, "n": int(limit)},
-            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "n": int(limit)}},
-            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s},
-            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms},
-            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s}},
-            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms}},
-        ]
+        body = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": interval,
+                "startTime": start_ms,
+                "endTime": now_ms
+            }
+        }
 
         backoff = 0.6
         last_err = None
-        for attempt in range(6):  # retry a few times (handles 429)
-            for body in bodies:
-                try:
-                    _debug(f"POST {url} json={body}")
-                    r = _http_post(url, json=body, timeout=25)
+        for _ in range(6):  # retry a few times (handles 429s gracefully)
+            try:
+                _debug(f"POST {url} json={body}")
+                r = _http_post(url, json=body, timeout=25)
 
-                    # 429: gentle backoff, then try again
-                    if r.status_code == 429:
-                        _debug("429 rate limited; backing off…")
-                        time.sleep(backoff)
-                        backoff = min(backoff * 1.8, 6.0)
-                        continue
-
-                    # Other HTTP errors: try next body shape
-                    if r.status_code >= 400:
-                        last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
-                        _debug(f"bad status: {last_err}")
-                        continue
-
-                    payload = r.json()
-                    rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
-                    if not rows:
-                        last_err = RuntimeError("unrecognized_payload")
-                        continue
-
-                    df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-                    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-                    df.sort_values("time", inplace=True)
-                    return df
-
-                except Exception as e:
-                    last_err = e
-                    _debug(f"exception: {e}")
-                    time.sleep(0.25)
+                if r.status_code == 429:
+                    _debug("429 rate limited; backing off…")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 1.8, 6.0)
                     continue
+
+                if r.status_code >= 400:
+                    last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
+                    _debug(f"bad status: {last_err}")
+                    continue
+
+                payload = r.json()
+                rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
+                if not rows:
+                    last_err = RuntimeError("unrecognized_payload")
+                    continue
+
+                df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+                df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+                df.sort_values("time", inplace=True)
+                return df
+
+            except Exception as e:
+                last_err = e
+                _debug(f"exception: {e}")
+                time.sleep(0.25)
+                continue
 
         raise last_err or RuntimeError("Failed to fetch Hyperliquid candles")
 
@@ -262,7 +252,8 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol
                 qv = float(qv)
             except Exception:
                 qv = 0.0
-            vols[sym] = max(vols.get(s, 0.0) if (s := sym) in vols else 0.0, qv)
+            # keep the max seen per symbol
+            vols[sym] = max(vols.get(sym, 0.0), qv)
     except Exception as e:
         _debug(f"tickers/volume error: {e}")
 
