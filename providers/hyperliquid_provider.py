@@ -4,12 +4,11 @@ import time
 import pandas as pd
 from .base import BaseProvider
 
-# ---------- Config (override via env if needed) ----------
 HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz")
 HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")
 HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")
+HL_ALT_BASE    = os.getenv("HL_ALT_BASE", "").strip()  # optional fallback base, e.g. another HL API host
 
-# Map TF strings → API values Hyperliquid accepts (5m, 1h, 1d, etc.)
 DEFAULT_TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
     "1h":"1h","2h":"2h","4h":"4h","6h":"6h","12h":"12h",
@@ -17,16 +16,18 @@ DEFAULT_TF_MAP = {
 }
 TF_MAP = {**DEFAULT_TF_MAP}
 
-# ---------- Tiny utils ----------
+# max bars per POST; lower value -> fewer 500s/429s
+HL_MAX_CHUNK = int(os.getenv("HL_MAX_CHUNK", "250"))
+
 def _debug(msg: str):
     if os.getenv("DEBUG", "").strip().lower() in ("1","true","yes","on"):
         try:
-            from discord_sender import send_info  # avoid hard dep at import time
+            from discord_sender import send_info
             send_info(f"[HL] {msg}")
         except Exception:
             print(f"[HL] {msg}")
 
-def _http_post(url, json, timeout=20):
+def _http_post_raw(url, json, timeout=25):
     import httpx
     return httpx.post(url, json=json, timeout=timeout)
 
@@ -48,14 +49,17 @@ def _extract_list(obj):
 
 def _to_ms(x):
     ts = int(float(x))
-    if ts < 10_000_000_000:  # seconds → ms
+    if ts < 10_000_000_000:  # seconds -> ms
         ts *= 1000
     return ts
 
 def _parse_rows(payload):
     """
-    Normalize various candle payloads to rows:
-      [time_ms, open, high, low, close, volume]
+    Normalize to rows: [time_ms, open, high, low, close, volume]
+    Supports:
+      - list of dicts with {t/ts/time, o/open, h/high, l/low, c/close, v/volume}
+      - list of arrays [t, o, h, l, c, v]
+      - dict of arrays {t,o,h,l,c,v} or {time,open,high,low,close,volume}
     """
     data = payload
     rows = None
@@ -63,7 +67,6 @@ def _parse_rows(payload):
     if isinstance(payload, dict):
         maybe = _extract_list(payload)
         if maybe is None:
-            # dict-of-arrays fallback: {t/o/h/l/c/v: [...] } or {time/open/...}
             short = all(k in payload for k in ("t","o","h","l","c","v"))
             long  = all(k in payload for k in ("time","open","high","low","close","volume"))
             if short or long:
@@ -96,7 +99,6 @@ def _parse_rows(payload):
     return rows or None
 
 def _force_quote(sym: str) -> str:
-    # Hyperliquid perps quote in USD
     target = (os.getenv("HL_FORCE_QUOTE", "USD") or "USD").upper()
     base, sep, quote = sym.upper().partition("/")
     return f"{base}/{target}" if sep and quote != target else sym.upper()
@@ -108,7 +110,6 @@ def _secs_per_bar(bar: str) -> int:
     except Exception:
         return 60
 
-# ---------- Provider ----------
 class HyperliquidProvider(BaseProvider):
     def __init__(self):
         self._markets = {}
@@ -116,76 +117,120 @@ class HyperliquidProvider(BaseProvider):
     def load_markets(self) -> dict:
         return self._markets
 
-    def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Fetch candles via POST /info with:
-          {"type":"candleSnapshot","req":{"coin": <BASE>, "interval": <TF>, "startTime": <ms>, "endTime": <ms>}}
-        Uses ms timestamps (required). Retries 429s with backoff.
-        """
-        symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
-        coin     = symbol.split("/")[0]           # "BTC"
-        interval = TF_MAP.get(timeframe, timeframe)
-        url      = HL_REST_BASE.rstrip("/") + "/info"
-
-        now_ms   = int(time.time() * 1000)
-        spb_ms   = _secs_per_bar(interval) * 1000
-        start_ms = now_ms - (limit + 5) * spb_ms  # a few extra bars for safety
-
+    # ---- internal: one chunk fetch ----
+    def _fetch_chunk(self, base_url: str, coin: str, interval: str, start_ms: int, end_ms: int):
         body = {
             "type": "candleSnapshot",
             "req": {
                 "coin": coin,
                 "interval": interval,
-                "startTime": start_ms,
-                "endTime": now_ms
+                "startTime": int(start_ms),
+                "endTime": int(end_ms),
             }
         }
-
         backoff = 0.6
         last_err = None
-        for _ in range(6):  # retry a few times (handles 429s gracefully)
+        for _ in range(5):
             try:
-                _debug(f"POST {url} json={body}")
-                r = _http_post(url, json=body, timeout=25)
-
-                if r.status_code == 429:
-                    _debug("429 rate limited; backing off…")
+                _debug(f"POST {base_url}/info json={body}")
+                r = _http_post_raw(base_url.rstrip("/") + "/info", json=body, timeout=25)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    # log server text to help diagnose
+                    try:
+                        _debug(f"server_resp: {r.text[:300]}")
+                    except Exception:
+                        pass
                     time.sleep(backoff)
                     backoff = min(backoff * 1.8, 6.0)
                     continue
-
                 if r.status_code >= 400:
+                    # 4xx (e.g., 422) — log body and bail this attempt
+                    try:
+                        _debug(f"{r.status_code} {r.reason_phrase} body={r.text[:300]}")
+                    except Exception:
+                        pass
                     last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
-                    _debug(f"bad status: {last_err}")
-                    continue
-
+                    return None, last_err
                 payload = r.json()
                 rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
                 if not rows:
                     last_err = RuntimeError("unrecognized_payload")
-                    continue
-
-                df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-                df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-                df.sort_values("time", inplace=True)
-                return df
-
+                    return None, last_err
+                return rows, None
             except Exception as e:
                 last_err = e
-                _debug(f"exception: {e}")
-                time.sleep(0.25)
+                time.sleep(0.3)
                 continue
+        return None, last_err or RuntimeError("chunk_fetch_failed")
 
-        raise last_err or RuntimeError("Failed to fetch Hyperliquid candles")
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        """
+        Fetch up to `limit` bars by paging in chunks (HL_MAX_CHUNK).
+        This reduces server stress and avoids 500s.
+        """
+        symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
+        coin     = symbol.split("/")[0]           # "BTC"
+        interval = TF_MAP.get(timeframe, timeframe)
+        spb_ms   = _secs_per_bar(interval) * 1000
+
+        needed   = int(limit)
+        now_ms   = int(time.time() * 1000)
+        end_ms   = now_ms
+        out_rows = []
+
+        bases = [HL_REST_BASE]
+        if HL_ALT_BASE:
+            bases.append(HL_ALT_BASE)
+
+        while needed > 0:
+            # request a chunk window
+            chunk_n   = min(HL_MAX_CHUNK, needed)
+            start_ms  = end_ms - (chunk_n + 2) * spb_ms  # pad 2 bars
+            got_rows  = None
+            last_err  = None
+
+            for base in bases:
+                rows, err = self._fetch_chunk(base, coin, interval, start_ms, end_ms)
+                if rows:
+                    got_rows = rows
+                    break
+                last_err = err
+
+            if not got_rows:
+                # couldn't fetch this chunk — break to avoid tight loop
+                raise last_err or RuntimeError("Failed to fetch chunk")
+
+            # extend and move the window backward
+            out_rows.extend(got_rows)
+            end_ms = start_ms + spb_ms  # step one bar earlier to avoid overlap
+            needed -= len(got_rows)
+            # if server returned fewer than asked (near history start), stop
+            if len(got_rows) < chunk_n // 2:
+                break
+
+            # small pause between chunks to be kind to the API
+            time.sleep(0.15)
+
+        if not out_rows:
+            raise RuntimeError("No candles returned")
+
+        # build dataframe
+        df = pd.DataFrame(out_rows, columns=["time","open","high","low","close","volume"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df.sort_values("time", inplace=True)
+        # dedupe (if overlapping windows)
+        df = df.drop_duplicates(subset=["time"], keep="last")
+        # trim to exactly `limit` most recent closed bars
+        if len(df) > limit:
+            df = df.iloc[-limit:]
+        return df
 
     def fetch_funding_rate(self, symbol: str):
-        # Not implemented for HL in this bot; return None so the scanner doesn't block.
         return None
 
 
-# ---------- Auto-markets helpers (optional) ----------
+# ---------- Optional auto-markets helpers ----------
 def _norm_symbol_from_inst(inst: dict):
-    # Accept: "BTC-USD" / "BTC_USD" / "BTCUSD"
     inst_id = inst.get("instId") or inst.get("symbol") or inst.get("instrumentId")
     if not inst_id:
         return None
@@ -200,10 +245,6 @@ def _norm_symbol_from_inst(inst: dict):
     return None
 
 def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
-    """
-    Tries to list instruments (if HL exposes it on your node).
-    If it returns nothing, your bot will fall back to the SYMBOLS env.
-    """
     base = HL_REST_BASE.rstrip("/")
     url  = base + HL_INSTRUMENTS
     try:
@@ -226,10 +267,6 @@ def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
         return []
 
 def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol=0.0):
-    """
-    Attempts to rank by 24h quote volume (if HL exposes tickers on your node).
-    Falls back to the first N symbols if no volume field is available.
-    """
     if not symbols:
         return []
     base = HL_REST_BASE.rstrip("/")
@@ -252,7 +289,6 @@ def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol
                 qv = float(qv)
             except Exception:
                 qv = 0.0
-            # keep the max seen per symbol
             vols[sym] = max(vols.get(sym, 0.0), qv)
     except Exception as e:
         _debug(f"tickers/volume error: {e}")
