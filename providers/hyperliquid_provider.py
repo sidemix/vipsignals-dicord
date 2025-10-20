@@ -149,6 +149,13 @@ class HyperliquidProvider(BaseProvider):
 
     def load_markets(self) -> dict:
         return self._markets
+# ---- expose coin list so main.py can filter SYMBOLS cleanly ----
+def list_available_coins() -> set[str]:
+    """
+    Returns a cached set of available perp coin bases from /info {type:'allMids'}.
+    """
+    # reuse the cache we already maintain
+    return _refresh_available_coins(force=False) or set()
 
     # ---- internal: one chunk fetch ----
     def _fetch_chunk(self, base_url: str, coin: str, interval: str, start_ms: int, end_ms: int):
