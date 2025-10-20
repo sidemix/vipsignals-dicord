@@ -7,6 +7,22 @@ from config import Config as C
 from indicators import ema, atr, adx, sma
 from discord_sender import send_signal_embed, send_info
 
+# ---- add near top (after imports) ----
+import itertools
+SCAN_BATCH = int(os.getenv("SCAN_BATCH", "8"))   # how many symbols per loop
+
+# ---- in main(), replace the while loop body with this ----
+    symbols_cycle = itertools.cycle([C.SYMBOLS[i:i+SCAN_BATCH] for i in range(0, len(C.SYMBOLS), SCAN_BATCH)])
+    while True:
+        try:
+            batch = next(symbols_cycle)
+            for s in batch:
+                scan_symbol(s)
+        except Exception as e:
+            _maybe_info(f"Error: `{e}`")
+        time.sleep(C.POLL_SECONDS)
+
+
 # ---------------- Utility flags ----------------
 QUIET = (
     str(getattr(C, "DEBUG", False)).lower() not in ("1", "true", "yes", "on")
