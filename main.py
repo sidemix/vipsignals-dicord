@@ -1,176 +1,276 @@
-import math
-import time
+# providers/hyperliquid_provider.py
 import os
-import itertools
+import time
 import pandas as pd
+from .base import BaseProvider
 
-from config import Config as C
-from indicators import ema, atr, adx, sma
-from discord_sender import send_signal_embed, send_info
-from providers.base import BaseProvider
-from providers.ccxt_provider import CcxtProvider
-from providers.blofin_provider import BlofinProvider
-from providers.hyperliquid_provider import HyperliquidProvider
+# ---------- Config (override via env if needed) ----------
+HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz")
+# Leave HL_KLINES unset; we post to /info with candleSnapshot
+HL_KLINES      = os.getenv("HL_KLINES", "")
+HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")
+HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")
 
-# ---------------- Utility flags ----------------
-QUIET = str(getattr(C, "DEBUG", False)).lower() not in ("1", "true", "yes", "on") and \
-        str(getattr(C, "QUIET", False) if hasattr(C, "QUIET") else False).lower() in ("1", "true", "yes", "on")
+# Map TF strings → common API values
+DEFAULT_TF_MAP = {
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+    "1h":"1h","2h":"2h","4h":"4h","6h":"6h","12h":"12h",
+    "1d":"1d"
+}
+TF_MAP = {**DEFAULT_TF_MAP}
 
-def _maybe_info(msg: str):
-    if not QUIET:
+# ---------- Tiny utils ----------
+def _debug(msg: str):
+    if os.getenv("DEBUG", "").strip().lower() in ("1","true","yes","on"):
         try:
-            send_info(msg)
+            from discord_sender import send_info  # avoid hard dep at import time
+            send_info(f"[HL] {msg}")
         except Exception:
-            pass
+            print(f"[HL] {msg}")
 
-# --------------- Provider factory ---------------
-def make_provider() -> BaseProvider:
-    if C.PROVIDER.lower() == "blofin":
-        return BlofinProvider()
-    if C.PROVIDER.lower() == "hyperliquid":
-        return HyperliquidProvider()
-    return CcxtProvider(C.EXCHANGE)
+def _http_post(url, json, timeout=20):
+    import httpx
+    return httpx.post(url, json=json, timeout=timeout)
 
-PROV = make_provider()
+def _http_get_json(url, params=None, timeout=15):
+    import httpx
+    r = httpx.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-# ---------------- State ----------------
-sent = {}                # (symbol:tstamp_ns)
-last_bar_index = {}      # symbol -> last tstamp_ns
+def _extract_list(obj):
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for k in ("data","result","rows","list","candles","klines","kline","items"):
+            v = obj.get(k)
+            if isinstance(v, list):
+                return v
+    return None
 
-# ---------------- Helpers ----------------
-def format_tps(price: float, atr_val: float, multipliers):
-    return [price + m * atr_val for m in multipliers]
+def _to_ms(x):
+    ts = int(float(x))
+    if ts < 10_000_000_000:  # seconds → ms
+        ts *= 1000
+    return ts
 
-def long_setup(close_price, atr_v):
-    entry_high = close_price - C.PULL_U * atr_v
-    entry_low  = close_price - C.PULL_L * atr_v
-    sl         = close_price - C.RISK_ATR * atr_v
-    return entry_high, entry_low, sl
+def _parse_rows(payload):
+    """
+    Normalize various candle payloads to:
+      [time_ms, open, high, low, close, volume]
+    """
+    data = payload
+    rows = None
 
-def short_setup(close_price, atr_v):
-    entry_low  = close_price + C.PULL_U * atr_v
-    entry_high = close_price + C.PULL_L * atr_v
-    sl         = close_price + C.RISK_ATR * atr_v
-    return entry_high, entry_low, sl
-
-def passes_filters(df: pd.DataFrame):
-    adx_last = float(df["adx"].iloc[-2])
-    vol_last = float(df["volume"].iloc[-2])
-    vol_sma  = float(df["vol_sma20"].iloc[-2])
-    if math.isnan(adx_last) or adx_last < C.MIN_ADX:
-        return False
-    if math.isnan(vol_sma) or vol_last < C.VOL_MULT * vol_sma:
-        return False
-    return True
-
-def htf_trend_ok(symbol: str, want_long: bool) -> bool:
-    if not getattr(C, "REQUIRE_TREND_HTF", True):
-        return True
-    try:
-        df_htf = PROV.fetch_ohlcv_df(symbol, C.HTF, 300)
-        if len(df_htf) < 210:
-            return True
-        df_htf["ema200"] = ema(df_htf["close"], 200)
-        price  = float(df_htf["close"].iloc[-2])
-        ema200 = float(df_htf["ema200"].iloc[-2])
-        return price > ema200 if want_long else price < ema200
-    except Exception:
-        return True
-
-def scan_symbol(symbol: str):
-    df = PROV.fetch_ohlcv_df(symbol, C.TIMEFRAME, C.MIN_BARS)
-    if len(df) < C.MIN_BARS:
-        return
-
-    df["ema5"]   = ema(df["close"], 5)
-    df["ema50"]  = ema(df["close"], 50)
-    df["ema200"] = ema(df["close"], 200)
-    df["atr"]    = atr(df, 14)
-    df["adx"]    = adx(df, 14)
-    df["vol_sma20"] = sma(df["volume"], 20)
-
-    row_prev  = df.iloc[-3]
-    row       = df.iloc[-2]
-    tstamp_ns = int(row["time"].value)
-
-    key = f"{symbol}:{tstamp_ns}"
-    if key in sent:
-        return
-
-    bullCross = (df["ema5"].iloc[-2] > df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] <= df["ema50"].iloc[-3]) and (row["close"] > df["ema200"].iloc[-2])
-    bearCross = (df["ema5"].iloc[-2] < df["ema50"].iloc[-2]) and (df["ema5"].iloc[-3] >= df["ema50"].iloc[-3]) and (row["close"] < df["ema200"].iloc[-2])
-
-    if not passes_filters(df):
-        return
-
-    prev_t = last_bar_index.get(symbol)
-    if prev_t is not None:
-        bar_ns = int(df["time"].iloc[-1].value) - int(df["time"].iloc[-2].value)
-        if bar_ns > 0:
-            bars_since = (tstamp_ns - prev_t) // bar_ns
-            if bars_since < C.COOLDOWN_BARS:
-                return
-
-    # ----- LONG -----
-    if bullCross and htf_trend_ok(symbol, True) and not math.isnan(row["atr"]):
-        eh, el, sl = long_setup(row["close"], row["atr"])
-        tps = format_tps(row["close"], row["atr"], C.TP_MULT)
-        send_signal_embed(symbol, "LONG", C.LEVERAGE, eh, el, sl, tps, extras={"TF": C.TIMEFRAME})
-        sent[key] = True
-        last_bar_index[symbol] = tstamp_ns
-        return
-
-    # ----- SHORT -----
-    if bearCross and htf_trend_ok(symbol, False) and not math.isnan(row["atr"]):
-        eh, el, sl = short_setup(row["close"], row["atr"])
-        tps = [row["close"] - m * row["atr"] for m in C.TP_MULT]
-        send_signal_embed(symbol, "SHORT", C.LEVERAGE, eh, el, sl, tps, extras={"TF": C.TIMEFRAME})
-        sent[key] = True
-        last_bar_index[symbol] = tstamp_ns
-        return
-
-def maybe_auto_symbols():
-    if C.PROVIDER.lower() not in ("blofin", "hyperliquid"):
-        return
-    if not getattr(C, "AUTO_SYMBOLS", False):
-        return
-    try:
-        if C.PROVIDER.lower() == "blofin":
-            from providers.blofin_provider import list_blofin_symbols, top_by_volume
-            syms = list_blofin_symbols()
-            picked = top_by_volume(syms)
+    if isinstance(payload, dict):
+        maybe = _extract_list(payload)
+        if maybe is None:
+            # dict-of-arrays fallback: {t/o/h/l/c/v: [...] } or {time/open/...}
+            short = all(k in payload for k in ("t","o","h","l","c","v"))
+            long  = all(k in payload for k in ("time","open","high","low","close","volume"))
+            if short or long:
+                T = payload["t"] if short else payload["time"]
+                O = payload["o"] if short else payload["open"]
+                H = payload["h"] if short else payload["high"]
+                L = payload["l"] if short else payload["low"]
+                C = payload["c"] if short else payload["close"]
+                V = payload["v"] if short else payload["volume"]
+                n = min(len(T), len(O), len(H), len(L), len(C), len(V))
+                return [[_to_ms(T[i]), float(O[i]), float(H[i]), float(L[i]), float(C[i]), float(V[i])] for i in range(n)]
         else:
-            from providers.hyperliquid_provider import list_hl_symbols, top_by_volume
-            syms = list_hl_symbols()
-            picked = top_by_volume(syms)
-        if picked:
-            C.SYMBOLS = picked
-            _maybe_info(f"Auto symbols: {', '.join(C.SYMBOLS)}")
+            data = maybe
+
+    rows = []
+    if isinstance(data, list) and data:
+        if isinstance(data[0], dict):
+            for x in data:
+                ts  = _to_ms(x.get("ts") or x.get("time") or x.get("t"))
+                op  = float(x.get("open")  or x.get("o"))
+                hi  = float(x.get("high")  or x.get("h"))
+                lo  = float(x.get("low")   or x.get("l"))
+                cl  = float(x.get("close") or x.get("c"))
+                vol = float(x.get("volume")or x.get("v"))
+                rows.append([ts, op, hi, lo, cl, vol])
+        elif isinstance(data[0], (list, tuple)) and len(data[0]) >= 6:
+            for x in data:
+                ts = _to_ms(x[0])
+                rows.append([ts, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])])
+    return rows or None
+
+def _force_quote(sym: str) -> str:
+    # Hyperliquid perps quote in USD
+    target = (os.getenv("HL_FORCE_QUOTE", "USD") or "USD").upper()
+    base, sep, quote = sym.upper().partition("/")
+    return f"{base}/{target}" if sep and quote != target else sym.upper()
+
+# ---------- Provider ----------
+class HyperliquidProvider(BaseProvider):
+    def __init__(self):
+        self._markets = {}
+
+    def load_markets(self) -> dict:
+        return self._markets
+
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+        """
+        Fetch candles by POSTing to /info with known working shapes:
+          1) {"type":"candleSnapshot","coin":"BTC","interval":"5m","n":400}
+          2) same, but nested in "req"
+          3) start/end in seconds and milliseconds (some nodes require ranges)
+        Retries on 429 with backoff.
+        """
+        symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
+        coin     = symbol.split("/")[0]           # "BTC"
+        interval = TF_MAP.get(timeframe, timeframe)
+        url      = HL_REST_BASE.rstrip("/") + "/info"
+
+        # time ranges in both seconds and ms
+        now_s  = int(time.time())
+        now_ms = now_s * 1000
+
+        def _secs_per_bar(bar: str) -> int:
+            try:
+                n, u = int(bar[:-1]), bar[-1]
+                return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60)
+            except Exception:
+                return 60
+
+        spb = _secs_per_bar(interval)
+        start_s  = now_s  - (limit + 5) * spb
+        start_ms = now_ms - (limit + 5) * spb * 1000
+
+        bodies = [
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "n": int(limit)},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "n": int(limit)}},
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s},
+            {"type": "candleSnapshot", "coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_s,  "endTime": now_s}},
+            {"type": "candleSnapshot", "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": now_ms}},
+        ]
+
+        backoff = 0.6
+        last_err = None
+        for attempt in range(6):  # retry a few times (handles 429)
+            for body in bodies:
+                try:
+                    _debug(f"POST {url} json={body}")
+                    r = _http_post(url, json=body, timeout=25)
+
+                    # 429: gentle backoff, then try again
+                    if r.status_code == 429:
+                        _debug("429 rate limited; backing off…")
+                        time.sleep(backoff)
+                        backoff = min(backoff * 1.8, 6.0)
+                        continue
+
+                    # Other HTTP errors: try next body shape
+                    if r.status_code >= 400:
+                        last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
+                        _debug(f"bad status: {last_err}")
+                        continue
+
+                    payload = r.json()
+                    rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
+                    if not rows:
+                        last_err = RuntimeError("unrecognized_payload")
+                        continue
+
+                    df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+                    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+                    df.sort_values("time", inplace=True)
+                    return df
+
+                except Exception as e:
+                    last_err = e
+                    _debug(f"exception: {e}")
+                    time.sleep(0.25)
+                    continue
+
+        raise last_err or RuntimeError("Failed to fetch Hyperliquid candles")
+
+    def fetch_funding_rate(self, symbol: str):
+        # Not implemented for HL in this bot; return None so the scanner doesn't block.
+        return None
+
+
+# ---------- Auto-markets helpers (optional) ----------
+def _norm_symbol_from_inst(inst: dict):
+    # Accept: "BTC-USD" / "BTC_USD" / "BTCUSD"
+    inst_id = inst.get("instId") or inst.get("symbol") or inst.get("instrumentId")
+    if not inst_id:
+        return None
+    s = str(inst_id).replace("_", "-").upper()
+    if "-" in s:
+        base, _, quote = s.partition("-")
+        return f"{base}/{quote}"
+    if s.endswith("USD"):
+        return f"{s[:-3]}/USD"
+    if s.endswith("USDT"):
+        return f"{s[:-4]}/USDT"
+    return None
+
+def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
+    """
+    Tries to list instruments (if HL exposes it on your node).
+    If it returns nothing, your bot will fall back to the SYMBOLS env.
+    """
+    base = HL_REST_BASE.rstrip("/")
+    url  = base + HL_INSTRUMENTS
+    try:
+        payload = _http_get_json(url, params={})
+        items = _extract_list(payload) or []
+        out = []
+        for inst in items:
+            sym = _norm_symbol_from_inst(inst)
+            if not sym:
+                continue
+            quote = sym.split("/")[-1].upper()
+            if want_quote and quote != want_quote.upper():
+                continue
+            out.append(sym)
+        out = sorted(set(out))
+        _debug(f"instruments -> {len(out)} symbols ({want_quote})")
+        return out
     except Exception as e:
-        _maybe_info(f"Auto symbols error: {e}")
+        _debug(f"instruments error: {e}")
+        return []
 
-def main():
-    maybe_auto_symbols()
+def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol=0.0):
+    """
+    Attempts to rank by 24h quote volume (if HL exposes tickers on your node).
+    Falls back to the first N symbols if no volume field is available.
+    """
+    if not symbols:
+        return []
+    base = HL_REST_BASE.rstrip("/")
+    url  = base + HL_TICKERS
 
-    banner = f"Started scanner on **{C.PROVIDER}** | TF {C.TIMEFRAME} | Symbols: {', '.join(C.SYMBOLS)}"
-    _maybe_info(banner)
+    vols = {}
+    try:
+        payload = _http_get_json(url, params={})
+        items = _extract_list(payload) or []
+        for t in items:
+            inst_id = t.get("instId") or t.get("symbol") or t.get("instrumentId")
+            sym = _norm_symbol_from_inst({"instId": inst_id}) if inst_id else None
+            if not sym or sym not in symbols:
+                continue
+            q = sym.split("/")[-1].upper()
+            if want_quote and q != want_quote.upper():
+                continue
+            qv = t.get("volUsd") or t.get("quoteVolume") or t.get("vol24hQuote") or t.get("volUsd24h") or 0
+            try:
+                qv = float(qv)
+            except Exception:
+                qv = 0.0
+            vols[sym] = max(vols.get(s, 0.0) if (s := sym) in vols else 0.0, qv)
+    except Exception as e:
+        _debug(f"tickers/volume error: {e}")
 
-    throttle_ms = int(os.getenv("THROTTLE_MS", "150"))
-    SCAN_BATCH  = int(os.getenv("SCAN_BATCH", "10"))
+    if vols:
+        scored = [(s, vols.get(s, 0.0)) for s in symbols]
+        if min_vol and min_vol > 0:
+            scored = [x for x in scored if x[1] >= min_vol]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in (scored[:top_n] if top_n else scored)]
 
-    # batch through symbols cyclically to avoid 429 rate limits
-    symbols_cycle = itertools.cycle([C.SYMBOLS[i:i + SCAN_BATCH] for i in range(0, len(C.SYMBOLS), SCAN_BATCH)])
-
-    while True:
-        try:
-            batch = next(symbols_cycle)
-            for s in batch:
-                scan_symbol(s)
-                if throttle_ms > 0:
-                    time.sleep(throttle_ms / 1000.0)
-        except Exception as e:
-            _maybe_info(f"Error: {e}")
-            time.sleep(2)
-
-if __name__ == "__main__":
-    main()
+    return symbols[:top_n] if top_n else symbols
