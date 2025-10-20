@@ -4,20 +4,23 @@ import time
 import pandas as pd
 from .base import BaseProvider
 
-HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz")
-HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")
-HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")
-HL_ALT_BASE    = os.getenv("HL_ALT_BASE", "").strip()  # optional fallback base, e.g. another HL API host
+# ---------- Config ----------
+HL_REST_BASE   = os.getenv("HL_REST_BASE", "https://api.hyperliquid.xyz").rstrip("/")
+HL_INSTRUMENTS = os.getenv("HL_INSTRUMENTS", "/api/v1/public/instruments")  # may not exist on all nodes
+HL_TICKERS     = os.getenv("HL_TICKERS", "/api/v1/public/tickers")          # may not exist on all nodes
+HL_ALT_BASE    = os.getenv("HL_ALT_BASE", "").strip()                       # optional second host
 
+# Max bars per POST (HL returns up to 500 per time-ranged request)
+HL_MAX_CHUNK   = int(os.getenv("HL_MAX_CHUNK", "200"))
+
+# Map TF strings → HL intervals (see docs/websocket list)
+# https://hyperliquid.gitbook.io/.../websocket/subscriptions
 DEFAULT_TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
-    "1h":"1h","2h":"2h","4h":"4h","6h":"6h","12h":"12h",
-    "1d":"1d"
+    "1h":"1h","2h":"2h","4h":"4h","8h":"8h","12h":"12h",
+    "1d":"1d","3d":"3d","1w":"1w","1M":"1M"
 }
 TF_MAP = {**DEFAULT_TF_MAP}
-
-# max bars per POST; lower value -> fewer 500s/429s
-HL_MAX_CHUNK = int(os.getenv("HL_MAX_CHUNK", "250"))
 
 def _debug(msg: str):
     if os.getenv("DEBUG", "").strip().lower() in ("1","true","yes","on"):
@@ -49,17 +52,14 @@ def _extract_list(obj):
 
 def _to_ms(x):
     ts = int(float(x))
-    if ts < 10_000_000_000:  # seconds -> ms
+    if ts < 10_000_000_000:  # seconds → ms
         ts *= 1000
     return ts
 
 def _parse_rows(payload):
     """
     Normalize to rows: [time_ms, open, high, low, close, volume]
-    Supports:
-      - list of dicts with {t/ts/time, o/open, h/high, l/low, c/close, v/volume}
-      - list of arrays [t, o, h, l, c, v]
-      - dict of arrays {t,o,h,l,c,v} or {time,open,high,low,close,volume}
+    Supports list of dicts, list of arrays, and dict-of-arrays.
     """
     data = payload
     rows = None
@@ -99,6 +99,7 @@ def _parse_rows(payload):
     return rows or None
 
 def _force_quote(sym: str) -> str:
+    # Hyperliquid perps quote in USD (we only need the base for 'coin' though)
     target = (os.getenv("HL_FORCE_QUOTE", "USD") or "USD").upper()
     base, sep, quote = sym.upper().partition("/")
     return f"{base}/{target}" if sep and quote != target else sym.upper()
@@ -106,9 +107,41 @@ def _force_quote(sym: str) -> str:
 def _secs_per_bar(bar: str) -> int:
     try:
         n, u = int(bar[:-1]), bar[-1]
-        return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60)
+        return n * (60 if u == "m" else 3600 if u == "h" else 86400 if u == "d" else 60*60*24*30 if u == "M" else 60)
     except Exception:
         return 60
+
+# ---------- Available coins cache ----------
+_AVAILABLE_COINS = None
+_AVAILABLE_TS = 0
+
+def _refresh_available_coins(force=False):
+    """
+    Uses the official /info with {type:'allMids'} to get the current perp coin set.
+    Caches for ~10 minutes.
+    """
+    global _AVAILABLE_COINS, _AVAILABLE_TS
+    now = time.time()
+    if _AVAILABLE_COINS is not None and not force and (now - _AVAILABLE_TS) < 600:
+        return _AVAILABLE_COINS
+
+    body = {"type": "allMids"}
+    try:
+        r = _http_post_raw(f"{HL_REST_BASE}/info", json=body, timeout=20)
+        if r.status_code >= 400:
+            _debug(f"allMids {r.status_code} {r.reason_phrase}: {r.text[:200]}")
+            # keep previous cache if any
+            return _AVAILABLE_COINS or set()
+        data = r.json()
+        # Response is a dict like {"BTC":"...", "ETH":"...", ...}
+        if isinstance(data, dict):
+            _AVAILABLE_COINS = set(data.keys())
+            _AVAILABLE_TS = now
+            _debug(f"available coins: {len(_AVAILABLE_COINS)}")
+            return _AVAILABLE_COINS
+    except Exception as e:
+        _debug(f"allMids error: {e}")
+    return _AVAILABLE_COINS or set()
 
 class HyperliquidProvider(BaseProvider):
     def __init__(self):
@@ -133,29 +166,27 @@ class HyperliquidProvider(BaseProvider):
         for _ in range(5):
             try:
                 _debug(f"POST {base_url}/info json={body}")
-                r = _http_post_raw(base_url.rstrip("/") + "/info", json=body, timeout=25)
+                r = _http_post_raw(base_url + "/info", json=body, timeout=25)
                 if r.status_code in (429, 500, 502, 503, 504):
-                    # log server text to help diagnose
+                    # Log body to help diagnose and back off
                     try:
-                        _debug(f"server_resp: {r.text[:300]}")
+                        _debug(f"server_resp({r.status_code}): {r.text[:240]}")
                     except Exception:
                         pass
                     time.sleep(backoff)
                     backoff = min(backoff * 1.8, 6.0)
                     continue
                 if r.status_code >= 400:
-                    # 4xx (e.g., 422) — log body and bail this attempt
                     try:
-                        _debug(f"{r.status_code} {r.reason_phrase} body={r.text[:300]}")
+                        _debug(f"{r.status_code} {r.reason_phrase} body={r.text[:240]}")
                     except Exception:
                         pass
-                    last_err = RuntimeError(f"{r.status_code} {r.reason_phrase}")
-                    return None, last_err
+                    return None, RuntimeError(f"{r.status_code} {r.reason_phrase}")
+
                 payload = r.json()
                 rows = _parse_rows(payload) or _parse_rows(_extract_list(payload) or {})
                 if not rows:
-                    last_err = RuntimeError("unrecognized_payload")
-                    return None, last_err
+                    return None, RuntimeError("unrecognized_payload")
                 return rows, None
             except Exception as e:
                 last_err = e
@@ -166,13 +197,19 @@ class HyperliquidProvider(BaseProvider):
     def fetch_ohlcv_df(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         """
         Fetch up to `limit` bars by paging in chunks (HL_MAX_CHUNK).
-        This reduces server stress and avoids 500s.
+        Validates coin first via allMids to avoid 500s on unknown names.
         """
-        symbol   = _force_quote(symbol)           # e.g., BTC/USDT -> BTC/USD
-        coin     = symbol.split("/")[0]           # "BTC"
+        symbol   = _force_quote(symbol)            # e.g., BTC/USDT -> BTC/USD
+        coin     = symbol.split("/")[0]            # "BTC"
         interval = TF_MAP.get(timeframe, timeframe)
-        spb_ms   = _secs_per_bar(interval) * 1000
 
+        # Validate coin against HL perp list
+        avail = _refresh_available_coins()
+        if avail and coin not in avail:
+            # Skip cleanly; caller will just not get a signal for this one
+            raise ValueError(f"hyperliquid does not list coin '{coin}' (skip)")
+
+        spb_ms   = _secs_per_bar(interval) * 1000
         needed   = int(limit)
         now_ms   = int(time.time() * 1000)
         end_ms   = now_ms
@@ -180,12 +217,12 @@ class HyperliquidProvider(BaseProvider):
 
         bases = [HL_REST_BASE]
         if HL_ALT_BASE:
-            bases.append(HL_ALT_BASE)
+            bases.append(HL_ALT_BASE.rstrip("/"))
 
         while needed > 0:
-            # request a chunk window
             chunk_n   = min(HL_MAX_CHUNK, needed)
-            start_ms  = end_ms - (chunk_n + 2) * spb_ms  # pad 2 bars
+            # Request window (pad 2 bars for safety)
+            start_ms  = end_ms - (chunk_n + 2) * spb_ms
             got_rows  = None
             last_err  = None
 
@@ -197,30 +234,43 @@ class HyperliquidProvider(BaseProvider):
                 last_err = err
 
             if not got_rows:
-                # couldn't fetch this chunk — break to avoid tight loop
-                raise last_err or RuntimeError("Failed to fetch chunk")
+                # As a last try, shrink the window by half once
+                sh_start = end_ms - (max(20, chunk_n // 2) + 2) * spb_ms
+                for base in bases:
+                    rows, err = self._fetch_chunk(base, coin, interval, sh_start, end_ms)
+                    if rows:
+                        got_rows = rows
+                        break
+                    last_err = err
 
-            # extend and move the window backward
+            if not got_rows:
+                # Give up on this symbol for now; bubble up (main loop will catch & continue)
+                raise last_err or RuntimeError("chunk_fetch_failed")
+
             out_rows.extend(got_rows)
-            end_ms = start_ms + spb_ms  # step one bar earlier to avoid overlap
+
+            # Move window back using earliest timestamp we received
+            earliest_ms = min(r[0] for r in got_rows)
+            end_ms = earliest_ms  # next chunk will end at earliest we have (no overlap)
             needed -= len(got_rows)
-            # if server returned fewer than asked (near history start), stop
-            if len(got_rows) < chunk_n // 2:
+
+            # If server returned very few rows, likely near history start; stop
+            if len(got_rows) < max(20, chunk_n // 3):
                 break
 
-            # small pause between chunks to be kind to the API
-            time.sleep(0.15)
+            # Small pause between chunks
+            time.sleep(0.12)
 
         if not out_rows:
             raise RuntimeError("No candles returned")
 
-        # build dataframe
+        # Build DF
         df = pd.DataFrame(out_rows, columns=["time","open","high","low","close","volume"])
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df.sort_values("time", inplace=True)
-        # dedupe (if overlapping windows)
         df = df.drop_duplicates(subset=["time"], keep="last")
-        # trim to exactly `limit` most recent closed bars
+
+        # Keep exactly `limit` most recent closed bars
         if len(df) > limit:
             df = df.iloc[-limit:]
         return df
@@ -229,7 +279,7 @@ class HyperliquidProvider(BaseProvider):
         return None
 
 
-# ---------- Optional auto-markets helpers ----------
+# ---------- Optional discovery helpers (best-effort; many nodes don't expose these) ----------
 def _norm_symbol_from_inst(inst: dict):
     inst_id = inst.get("instId") or inst.get("symbol") or inst.get("instrumentId")
     if not inst_id:
@@ -245,7 +295,7 @@ def _norm_symbol_from_inst(inst: dict):
     return None
 
 def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
-    base = HL_REST_BASE.rstrip("/")
+    base = HL_REST_BASE
     url  = base + HL_INSTRUMENTS
     try:
         payload = _http_get_json(url, params={})
@@ -269,7 +319,7 @@ def list_hl_symbols(inst_type="SWAP", want_quote="USD"):
 def top_by_volume(symbols, inst_type="SWAP", want_quote="USD", top_n=12, min_vol=0.0):
     if not symbols:
         return []
-    base = HL_REST_BASE.rstrip("/")
+    base = HL_REST_BASE
     url  = base + HL_TICKERS
 
     vols = {}
